@@ -36,7 +36,7 @@ npm install
 Create `.env` file:
 ```bash
 GITHUB_PAT=ghp_yourPersonalAccessTokenHere
-PORT=8787
+PORT=8788
 ```
 
 Get your GitHub PAT from [github.com/settings/tokens](https://github.com/settings/tokens) with `public_repo` scope.
@@ -61,12 +61,12 @@ ngrok config add-authtoken YOUR_NGROK_TOKEN
 node github-mcp-enhanced.js
 
 # Terminal 2: Create public tunnel
-ngrok http 8787
+ngrok http 8788
 ```
 
 You'll see:
 ```
-Forwarding: https://abc123.ngrok-free.app -> http://localhost:8787
+Forwarding: https://abc123.ngrok-free.app -> http://localhost:8788
 ```
 
 ### 5. Add to ChatGPT
@@ -113,7 +113,7 @@ Start a new chat with the connector enabled:
 - `npm start` - Start the enhanced MCP server
 - `npm run dev` - Start with auto-reload (if nodemon installed)
 
-The server runs on port 8787 by default (configurable in `.env`).
+The server runs on port 8788 by default (configurable in `.env`).
 
 ## Troubleshooting
 
@@ -124,7 +124,7 @@ The server runs on port 8787 by default (configurable in `.env`).
 
 **No requests in logs**
 - ChatGPT blocks localhost - you must use ngrok
-- Verify ngrok is running and forwarding to port 8787
+- Verify ngrok is running and forwarding to port 8788
 - Check ngrok dashboard at http://localhost:4040
 
 **Connector is grayed out**

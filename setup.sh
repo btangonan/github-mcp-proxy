@@ -42,7 +42,7 @@ if [ -f ".env" ]; then
 else
     # Create .env from example
     cp .env.example .env 2>/dev/null || echo "GITHUB_PAT=PASTE_YOUR_TOKEN_HERE
-PORT=8787" > .env
+PORT=8788" > .env
 fi
 
 # Guide user to get PAT

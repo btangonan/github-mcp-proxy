@@ -120,12 +120,12 @@ The server handles common GitHub API issues:
 ### Local Testing
 ```bash
 # Test tool listing
-curl -X POST http://localhost:8787/mcp \
+curl -X POST http://localhost:8788/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
 
 # Test directory browsing
-curl -X POST http://localhost:8787/mcp \
+curl -X POST http://localhost:8788/mcp \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc":"2.0",
@@ -140,7 +140,7 @@ curl -X POST http://localhost:8787/mcp \
 
 ### Health Check
 ```bash
-curl http://localhost:8787/health
+curl http://localhost:8788/health
 ```
 
 ## Deployment Options
@@ -178,7 +178,7 @@ curl http://localhost:8787/health
 
 ```bash
 GITHUB_PAT=ghp_xxxx  # GitHub Personal Access Token
-PORT=8787            # Server port (default: 8787)
+PORT=8788            # Server port (default: 8788)
 ```
 
 ## Security Considerations

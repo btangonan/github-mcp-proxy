@@ -11,7 +11,7 @@ cd github-mcp-proxy
 
 # Create .env file with your GitHub token
 echo "GITHUB_PAT=ghp_YOUR_TOKEN_HERE" > .env
-echo "PORT=8787" >> .env
+echo "PORT=8788" >> .env
 
 # Install dependencies
 npm install

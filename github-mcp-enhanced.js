@@ -661,7 +661,7 @@ app.post("/sse", async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 8787;
+const port = process.env.PORT || 8788;
 app.listen(port, () => {
   console.log("═══════════════════════════════════════════");
   console.log("✅ GitHub MCP Enhanced v2.0 Running");
