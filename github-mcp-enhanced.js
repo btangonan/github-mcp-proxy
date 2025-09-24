@@ -537,10 +537,12 @@ async function handleGetTree(args) {
 async function handleGetCommits(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = args.path ? validatePath(args.path) : undefined;
+  const branch = args.branch || args.ref; // Support both branch and ref parameters
   const limit = Math.min(Math.max(parseInt(args.limit) || 10, 1), 100);
 
   const params = { per_page: limit };
   if (path) params.path = path;
+  if (branch) params.sha = branch; // Critical fix: use sha parameter for branch
 
   const response = await githubRequest(`/repos/${owner}/${repo}/commits`, params);
 
@@ -734,14 +736,15 @@ if (config.prEnabled && config.prWhitelist.length > 0) {
 async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET') {
   const cacheKey = getCacheKey(endpoint, { params, headers, method });
 
-  // Only use cache for GET requests
-  if (method === 'GET') {
-    const cached = getCachedData(cacheKey);
-    if (cached) {
-      console.log(`📦 Cache hit for ${endpoint}`);
-      return cached;
-    }
-  }
+  // Disable caching to ensure fresh data
+  // ChatGPT needs real-time data, not cached responses
+  // if (method === 'GET') {
+  //   const cached = getCachedData(cacheKey);
+  //   if (cached) {
+  //     console.log(`📦 Cache hit for ${endpoint}`);
+  //     return cached;
+  //   }
+  // }
 
   try {
     console.log(`🌐 ${method} ${endpoint}`);
@@ -764,10 +767,10 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
       url: endpoint
     });
 
-    // Cache successful responses for GET requests only
-    if (method === 'GET') {
-      setCachedData(cacheKey, response.data);
-    }
+    // Disable caching to ensure fresh data
+    // if (method === 'GET') {
+    //   setCachedData(cacheKey, response.data);
+    // }
 
     return response.data;
   } catch (error) {
