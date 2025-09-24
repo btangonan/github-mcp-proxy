@@ -425,14 +425,25 @@ async function handleReadFile(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = validatePath(args.path);
   assert(path.length > 0, 'File path cannot be empty');
-  const branch = validateBranch(args.branch);
+  const branch = args.branch || args.ref; // Support both branch and ref parameters
+  const validatedBranch = validateBranch(branch);
+
+  // Enhanced logging for debugging
+  console.log(`📖 read_file called:
+    repo: ${owner}/${repo}
+    path: ${path}
+    requested branch/ref: ${branch || 'none'}
+    validated branch: ${validatedBranch}
+    args: ${JSON.stringify(args)}`);
 
   try {
     const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
-      ref: branch
+      ref: validatedBranch
     }, {
       Accept: "application/vnd.github.raw"
     });
+
+    console.log(`✅ read_file successful for branch: ${validatedBranch}`);
 
     return {
       content: [
@@ -441,33 +452,48 @@ async function handleReadFile(args) {
           text: JSON.stringify({
             path: path,
             content: response,
-            url: `https://github.com/${owner}/${repo}/blob/${branch}/${path}`
+            url: `https://github.com/${owner}/${repo}/blob/${validatedBranch}/${path}`,
+            branch: validatedBranch
           })
         }
       ]
     };
   } catch (error) {
-    // Try with master branch if main fails
-    if (branch === "main") {
-      const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
-        ref: "master"
-      }, {
-        Accept: "application/vnd.github.raw"
-      });
+    console.log(`❌ read_file failed for branch ${validatedBranch}: ${error.message}`);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              path: path,
-              content: response,
-              url: `https://github.com/${owner}/${repo}/blob/master/${path}`
-            })
-          }
-        ]
-      };
+    // Only try master fallback if we explicitly requested main and it failed
+    // This prevents silent fallback when a specific branch is requested
+    if (validatedBranch === "main" && error.statusCode === 404) {
+      console.log(`🔄 Trying master branch fallback...`);
+      try {
+        const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
+          ref: "master"
+        }, {
+          Accept: "application/vnd.github.raw"
+        });
+
+        console.log(`✅ read_file successful with master fallback`);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                path: path,
+                content: response,
+                url: `https://github.com/${owner}/${repo}/blob/master/${path}`,
+                branch: "master"
+              })
+            }
+          ]
+        };
+      } catch (masterError) {
+        console.log(`❌ Master fallback also failed: ${masterError.message}`);
+        throw masterError;
+      }
     }
+
+    // For any other branch or error, throw the original error
     throw error;
   }
 }
