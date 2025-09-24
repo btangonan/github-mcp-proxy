@@ -719,6 +719,222 @@ async function handleCreatePullRequest(args) {
   }
 }
 
+async function handleListPullRequests(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+
+  // Build query parameters
+  const params = {
+    per_page: args.limit || 30,
+    page: args.page || 1
+  };
+
+  // Add optional filters
+  if (args.state) params.state = args.state; // open, closed, all
+  if (args.base) params.base = validateBranch(args.base);
+  if (args.head) params.head = args.head.includes(':') ? args.head : `${owner}:${validateBranch(args.head)}`;
+  if (args.sort) params.sort = args.sort; // created, updated, popularity, long-running
+  if (args.direction) params.direction = args.direction; // asc, desc
+
+  try {
+    const response = await githubRequest(`/repos/${owner}/${repo}/pulls`, params);
+
+    const pullRequests = response.map(pr => ({
+      number: pr.number,
+      title: pr.title,
+      state: pr.state,
+      draft: pr.draft,
+      head: pr.head.ref,
+      base: pr.base.ref,
+      url: pr.html_url,
+      created_at: pr.created_at,
+      updated_at: pr.updated_at,
+      author: pr.user.login,
+      mergeable_state: pr.mergeable_state
+    }));
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            repository: `${owner}/${repo}`,
+            pull_requests: pullRequests,
+            page: params.page,
+            per_page: params.per_page
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    if (error.statusCode === 404) {
+      throw new Error(`Repository ${owner}/${repo} not found or you don't have access`);
+    }
+    throw error;
+  }
+}
+
+async function handleSearchPullRequests(args) {
+  const query = safeString(args.query, 500);
+  assert(query.length > 0, 'Search query cannot be empty');
+
+  // Automatically add is:pr to the query if not present
+  const prQuery = query.includes('is:pr') ? query : `is:pr ${query}`;
+
+  const params = {
+    q: prQuery,
+    per_page: args.limit || 30,
+    page: args.page || 1
+  };
+
+  // Add optional sort and order
+  if (args.sort) params.sort = args.sort; // comments, reactions, created, updated
+  if (args.order) params.order = args.order; // asc, desc
+
+  try {
+    const response = await githubRequest('/search/issues', params);
+
+    const pullRequests = response.items.map(pr => ({
+      number: pr.number,
+      title: pr.title,
+      repository: pr.repository_url.replace('https://api.github.com/repos/', ''),
+      state: pr.state,
+      draft: pr.draft || false,
+      url: pr.html_url,
+      created_at: pr.created_at,
+      updated_at: pr.updated_at,
+      author: pr.user.login,
+      labels: pr.labels.map(l => l.name),
+      comments: pr.comments
+    }));
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            query: prQuery,
+            total_count: response.total_count,
+            pull_requests: pullRequests,
+            page: params.page,
+            per_page: params.per_page
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    if (error.statusCode === 422) {
+      throw new Error(`Invalid search query: ${query}. Check GitHub search syntax.`);
+    }
+    throw error;
+  }
+}
+
+async function handleGetPullRequest(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const prNumber = parseInt(args.prNumber);
+  assert(!isNaN(prNumber) && prNumber > 0, 'PR number must be a positive integer');
+
+  try {
+    const pr = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+
+    // Get additional details if requested
+    let commits = null;
+    let files = null;
+    let reviews = null;
+
+    if (args.include_commits) {
+      const commitsResponse = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}/commits`, {
+        per_page: 100
+      });
+      commits = commitsResponse.map(c => ({
+        sha: c.sha,
+        message: c.commit.message,
+        author: c.commit.author.name,
+        date: c.commit.author.date
+      }));
+    }
+
+    if (args.include_files) {
+      const filesResponse = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}/files`, {
+        per_page: 100
+      });
+      files = filesResponse.map(f => ({
+        filename: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+        changes: f.changes
+      }));
+    }
+
+    if (args.include_reviews) {
+      const reviewsResponse = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}/reviews`, {
+        per_page: 100
+      });
+      reviews = reviewsResponse.map(r => ({
+        user: r.user.login,
+        state: r.state,
+        submitted_at: r.submitted_at,
+        body: r.body
+      }));
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            number: pr.number,
+            title: pr.title,
+            body: pr.body,
+            state: pr.state,
+            draft: pr.draft,
+            head: {
+              ref: pr.head.ref,
+              sha: pr.head.sha,
+              repo: pr.head.repo ? pr.head.repo.full_name : null
+            },
+            base: {
+              ref: pr.base.ref,
+              sha: pr.base.sha,
+              repo: pr.base.repo.full_name
+            },
+            url: pr.html_url,
+            created_at: pr.created_at,
+            updated_at: pr.updated_at,
+            closed_at: pr.closed_at,
+            merged_at: pr.merged_at,
+            merge_commit_sha: pr.merge_commit_sha,
+            author: pr.user.login,
+            assignees: pr.assignees.map(a => a.login),
+            reviewers: pr.requested_reviewers.map(r => r.login),
+            labels: pr.labels.map(l => ({ name: l.name, color: l.color })),
+            milestone: pr.milestone ? pr.milestone.title : null,
+            mergeable: pr.mergeable,
+            mergeable_state: pr.mergeable_state,
+            merged: pr.merged,
+            merged_by: pr.merged_by ? pr.merged_by.login : null,
+            comments: pr.comments,
+            review_comments: pr.review_comments,
+            commits: pr.commits,
+            additions: pr.additions,
+            deletions: pr.deletions,
+            changed_files: pr.changed_files,
+            ...(commits && { commit_details: commits }),
+            ...(files && { file_details: files }),
+            ...(reviews && { review_details: reviews })
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    if (error.statusCode === 404) {
+      throw new Error(`Pull request #${prNumber} not found in ${owner}/${repo}`);
+    }
+    throw error;
+  }
+}
+
 async function handleGetBranches(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
 
@@ -744,6 +960,92 @@ async function handleGetBranches(args) {
   };
 }
 
+async function handleCreateBranch(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const branchName = validateBranch(args.branch);
+  assert(branchName, 'Branch name is required');
+
+  // Check whitelist for branch creation (same security as PR creation)
+  if (config.prWhitelist.length > 0) {
+    const repoPath = `${owner}/${repo}`;
+    const isWhitelisted = config.prWhitelist.some(pattern => {
+      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
+      return regex.test(repoPath);
+    });
+
+    if (!isWhitelisted) {
+      throw new Error(`Repository ${repoPath} is not whitelisted for branch creation`);
+    }
+  }
+
+  try {
+    // Get the base branch (default to main branch)
+    const baseBranch = args.from || 'main';
+
+    // Get the SHA of the base branch
+    let baseSha;
+    try {
+      const baseBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${baseBranch}`);
+      baseSha = baseBranchData.object.sha;
+    } catch (error) {
+      if (error.statusCode === 404 && baseBranch === 'main') {
+        // Try master if main doesn't exist
+        const masterBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/master`);
+        baseSha = masterBranchData.object.sha;
+      } else {
+        throw error;
+      }
+    }
+
+    // Create the new branch
+    const response = await githubRequest(`/repos/${owner}/${repo}/git/refs`, {
+      method: 'POST',
+      body: JSON.stringify({
+        ref: `refs/heads/${branchName}`,
+        sha: baseSha
+      })
+    });
+
+    // Log branch creation for audit
+    await auditLog('BRANCH_CREATED', {
+      repo: `${owner}/${repo}`,
+      branch: branchName,
+      from: baseBranch,
+      sha: baseSha
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            branch: branchName,
+            from: baseBranch,
+            sha: baseSha,
+            message: `Successfully created branch '${branchName}' from '${baseBranch}'`,
+            url: `https://github.com/${owner}/${repo}/tree/${branchName}`
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    // Log branch creation failure
+    await auditLog('BRANCH_CREATE_FAILED', {
+      repo: `${owner}/${repo}`,
+      branch: branchName,
+      error: error.message
+    });
+
+    if (error.statusCode === 422) {
+      throw new Error(`Branch '${branchName}' already exists in ${owner}/${repo}`);
+    }
+    if (error.statusCode === 404) {
+      throw new Error(`Repository ${owner}/${repo} or base branch not found`);
+    }
+    throw error;
+  }
+}
+
 // Register all tools
 toolRegistry.set("search", handleSearch);
 toolRegistry.set("fetch", handleFetch);
@@ -753,10 +1055,16 @@ toolRegistry.set("get_tree", handleGetTree);
 toolRegistry.set("get_commits", handleGetCommits);
 toolRegistry.set("get_branches", handleGetBranches);
 
-// Register PR tool only if enabled
+// Register PR/branch tools only if enabled
 if (config.prEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("create_pull_request", handleCreatePullRequest);
+  toolRegistry.set("create_branch", handleCreateBranch);
 }
+
+// Register PR search/list tools (always available for reading)
+toolRegistry.set("list_pull_requests", handleListPullRequests);
+toolRegistry.set("search_pull_requests", handleSearchPullRequests);
+toolRegistry.set("get_pull_request", handleGetPullRequest);
 
 // Enhanced GitHub API wrapper with caching
 async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET') {
@@ -971,10 +1279,122 @@ app.post("/mcp", async (req, res) => {
                 },
                 required: ["repo"]
               }
+            },
+            {
+              name: "list_pull_requests",
+              description: "List pull requests in a repository",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  repo: {
+                    type: "string",
+                    description: "Repository (owner/repo)"
+                  },
+                  state: {
+                    type: "string",
+                    description: "Filter by state: open, closed, all (default: open)"
+                  },
+                  base: {
+                    type: "string",
+                    description: "Filter by base branch"
+                  },
+                  head: {
+                    type: "string",
+                    description: "Filter by head branch"
+                  },
+                  limit: {
+                    type: "number",
+                    description: "Max results (default 30)"
+                  },
+                  page: {
+                    type: "number",
+                    description: "Page number (default 1)"
+                  }
+                },
+                required: ["repo"]
+              }
+            },
+            {
+              name: "search_pull_requests",
+              description: "Search for pull requests using GitHub's search API",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  query: {
+                    type: "string",
+                    description: "Search query (automatically prepends is:pr)"
+                  },
+                  repo: {
+                    type: "string",
+                    description: "Optional: limit to specific repo (owner/name format)"
+                  },
+                  limit: {
+                    type: "number",
+                    description: "Max results (default 30)"
+                  }
+                },
+                required: ["query"]
+              }
+            },
+            {
+              name: "get_pull_request",
+              description: "Get detailed information about a specific pull request",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  repo: {
+                    type: "string",
+                    description: "Repository (owner/repo)"
+                  },
+                  prNumber: {
+                    type: "number",
+                    description: "Pull request number"
+                  },
+                  includeCommits: {
+                    type: "boolean",
+                    description: "Include commit list (default false)"
+                  },
+                  includeFiles: {
+                    type: "boolean",
+                    description: "Include changed files (default false)"
+                  },
+                  includeReviews: {
+                    type: "boolean",
+                    description: "Include reviews (default false)"
+                  }
+                },
+                required: ["repo", "prNumber"]
+              }
             }
           ]
         }
       });
+
+      // Add create_branch tool if PR features are enabled
+      if (PR_ENABLED) {
+        result.result.tools.push({
+          name: "create_branch",
+          description: "Create a new branch in a repository from an existing branch or commit. Use this when you need to create feature branches before opening pull requests",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo: {
+                type: "string",
+                description: "Repository in format owner/repo (e.g., 'octocat/hello-world')"
+              },
+              branch: {
+                type: "string",
+                description: "Name for the new branch (e.g., 'feat/new-feature')"
+              },
+              from: {
+                type: "string",
+                description: "Source branch or commit SHA to branch from (defaults to repository's default branch)"
+              }
+            },
+            required: ["repo", "branch"]
+          }
+        });
+      }
     }
 
     // Handle tool calls
