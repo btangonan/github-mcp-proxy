@@ -2,20 +2,102 @@ require("dotenv").config();
 
 const express = require("express");
 const axios = require("axios");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
-const GITHUB_TOKEN = process.env.GITHUB_PAT;
 
-if (!GITHUB_TOKEN) {
+// Configuration from environment variables
+const config = {
+  // Server configuration
+  port: parseInt(process.env.PORT) || 8788,
+  host: process.env.HOST || 'localhost',
+
+  // GitHub API configuration
+  githubToken: process.env.GITHUB_PAT,
+  githubApiTimeout: parseInt(process.env.GITHUB_API_TIMEOUT) || 30000,
+  githubRetryAttempts: parseInt(process.env.GITHUB_RETRY_ATTEMPTS) || 3,
+
+  // Rate limiting configuration
+  rateLimitWindow: parseInt(process.env.RATE_LIMIT_WINDOW) || 15 * 60 * 1000, // 15 minutes
+  rateLimitMax: parseInt(process.env.RATE_LIMIT_MAX) || 1000,
+
+  // Cache configuration
+  cacheTTL: parseInt(process.env.CACHE_TTL) || 5 * 60 * 1000, // 5 minutes
+  cacheMaxSize: parseInt(process.env.CACHE_MAX_SIZE) || 1000,
+
+  // Security configuration
+  bodySizeLimit: process.env.BODY_SIZE_LIMIT || '10mb',
+  enableTrustProxy: process.env.TRUST_PROXY === 'true',
+
+  // Logging configuration
+  logLevel: process.env.LOG_LEVEL || 'info',
+  enableAccessLog: process.env.ENABLE_ACCESS_LOG === 'true',
+
+  // CORS configuration
+  allowedOrigins: process.env.ALLOWED_ORIGINS ?
+    process.env.ALLOWED_ORIGINS.split(',') :
+    ['https://chatgpt.com', 'https://chat.openai.com', 'https://platform.openai.com'],
+
+  // PR creation configuration
+  prEnabled: process.env.PR_ENABLED === 'true',
+  prWhitelist: process.env.PR_WHITELIST ? process.env.PR_WHITELIST.split(',') : [],
+  prRateLimitMax: parseInt(process.env.PR_RATE_LIMIT_MAX) || 5,
+  prRateLimitWindow: parseInt(process.env.PR_RATE_LIMIT_WINDOW) || 60 * 60 * 1000, // 1 hour
+  prAuditLog: process.env.PR_AUDIT_LOG || './pr_audit.log',
+  prTemplateRequired: process.env.PR_TEMPLATE_REQUIRED === 'true'
+};
+
+// Validate required configuration
+if (!config.githubToken) {
   console.error("❌ Please set GITHUB_PAT environment variable.");
   process.exit(1);
 }
 
-// Enable CORS for ChatGPT
+console.log("📋 Server Configuration:");
+console.log(`   • Port: ${config.port}`);
+console.log(`   • Cache TTL: ${config.cacheTTL / 1000}s`);
+console.log(`   • Rate Limit: ${config.rateLimitMax} requests per ${config.rateLimitWindow / 60000} minutes`);
+console.log(`   • GitHub API Timeout: ${config.githubApiTimeout / 1000}s`);
+if (config.prEnabled) {
+  console.log(`   • PR Creation: ENABLED`);
+  console.log(`   • PR Whitelist: ${config.prWhitelist.length > 0 ? config.prWhitelist.join(', ') : 'None (disabled)'}`);
+  console.log(`   • PR Rate Limit: ${config.prRateLimitMax} per ${config.prRateLimitWindow / 60000} minutes`);
+}
+console.log("");
+
+// Security middleware
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow ChatGPT to embed content
+  crossOriginEmbedderPolicy: false
+}));
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: config.rateLimitWindow,
+  max: config.rateLimitMax,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // Skip rate limiting for health checks
+    return req.path === '/health';
+  }
+});
+app.use(limiter);
+
+// Enhanced CORS for ChatGPT
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "*");
-  res.header("Access-Control-Allow-Headers", "*");
+  const allowedOrigins = config.allowedOrigins;
+
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes(origin) || !origin) {
+    res.header("Access-Control-Allow-Origin", origin || "*");
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  res.header("Access-Control-Max-Age", "86400"); // 24 hours
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -23,17 +105,661 @@ app.use((req, res, next) => {
   next();
 });
 
-// Parse JSON bodies
-app.use(express.json());
+// Parse JSON bodies with configurable size limit
+app.use(express.json({ limit: config.bodySizeLimit }));
 
-// GitHub API client
+// Simple in-memory cache with configurable TTL
+const cache = new Map();
+
+// PR rate limiting tracker
+const prRateLimiter = new Map();
+
+// Audit logging for PR operations
+const fs = require('fs').promises;
+const path = require('path');
+
+async function auditLog(action, data) {
+  if (!config.prAuditLog) return;
+
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    action,
+    ...data
+  };
+
+  try {
+    await fs.appendFile(
+      config.prAuditLog,
+      JSON.stringify(logEntry) + '\n',
+      'utf8'
+    );
+  } catch (error) {
+    console.error('Failed to write audit log:', error.message);
+  }
+}
+
+// Cache cleanup to prevent memory leaks
+setInterval(() => {
+  if (cache.size > config.cacheMaxSize) {
+    // Remove oldest entries if cache is too large
+    const entries = Array.from(cache.entries());
+    const toDelete = entries.slice(0, Math.floor(cache.size * 0.2)); // Remove 20%
+    toDelete.forEach(([key]) => cache.delete(key));
+    console.log(`🧹 Cache cleanup: removed ${toDelete.length} entries`);
+  }
+}, 60000); // Check every minute
+
+// Enhanced GitHub API client with configurable timeouts and retries
 const github = axios.create({
   baseURL: "https://api.github.com",
+  timeout: config.githubApiTimeout,
   headers: {
-    Authorization: `Bearer ${GITHUB_TOKEN}`,
-    Accept: "application/vnd.github.v3+json"
+    Authorization: `Bearer ${config.githubToken}`,
+    Accept: "application/vnd.github.v3+json",
+    "User-Agent": "GitHub-MCP-Server/2.0"
   }
 });
+
+// Retry interceptor
+github.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const config = error.config;
+
+    // Don't retry if we've already retried the configured number of times
+    if (!config || config._retryCount >= config.githubRetryAttempts) {
+      return Promise.reject(error);
+    }
+
+    config._retryCount = config._retryCount || 0;
+    config._retryCount++;
+
+    // Retry on network errors or 5xx status codes
+    if (!error.response || (error.response.status >= 500 && error.response.status <= 599)) {
+      console.log(`🔄 Retrying GitHub API request (attempt ${config._retryCount})`);
+
+      // Exponential backoff: 1s, 2s, 4s
+      const delay = Math.pow(2, config._retryCount - 1) * 1000;
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      return github(config);
+    }
+
+    return Promise.reject(error);
+  }
+);
+
+// Cache helper functions
+function getCacheKey(url, params = {}) {
+  return `${url}:${JSON.stringify(params)}`;
+}
+
+function getCachedData(key) {
+  const cached = cache.get(key);
+  if (cached && Date.now() < cached.expiry) {
+    return cached.data;
+  }
+  cache.delete(key);
+  return null;
+}
+
+function setCachedData(key, data) {
+  cache.set(key, {
+    data,
+    expiry: Date.now() + config.cacheTTL
+  });
+}
+
+// Input validation functions
+function assert(condition, message = "Assertion failed") {
+  if (!condition) {
+    throw new Error(message);
+  }
+}
+
+function safeString(str, maxLength = 1000) {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[<>]/g, '').substring(0, maxLength);
+}
+
+function validateRepoFormat(repoId) {
+  assert(repoId && typeof repoId === 'string', 'Repository ID must be a string');
+  const parts = repoId.split('/');
+  assert(parts.length === 2, 'Repository ID must be in format "owner/repo"');
+  assert(parts[0] && parts[1], 'Both owner and repo name must be provided');
+  assert(/^[a-zA-Z0-9._-]+$/.test(parts[0]), 'Invalid owner name format');
+  assert(/^[a-zA-Z0-9._-]+$/.test(parts[1]), 'Invalid repo name format');
+  return parts;
+}
+
+function validatePath(path) {
+  if (!path) return '';
+  const safePath = safeString(path, 500);
+  assert(!safePath.includes('..'), 'Path traversal not allowed');
+  assert(!safePath.startsWith('/'), 'Absolute paths not allowed');
+  return safePath;
+}
+
+function validateBranch(branch) {
+  if (!branch) return 'main';
+  const safeBranch = safeString(branch, 100);
+  assert(/^[a-zA-Z0-9._/-]+$/.test(safeBranch), 'Invalid branch name format');
+  return safeBranch;
+}
+
+// Repository whitelist validation
+function isRepoWhitelisted(owner, repo) {
+  if (!config.prEnabled) return false;
+  if (config.prWhitelist.length === 0) return false;
+
+  const fullRepo = `${owner}/${repo}`;
+
+  // Check exact match or pattern match
+  return config.prWhitelist.some(pattern => {
+    if (pattern === fullRepo) return true;
+    if (pattern.endsWith('/*')) {
+      const ownerPattern = pattern.slice(0, -2);
+      return owner === ownerPattern;
+    }
+    return false;
+  });
+}
+
+// PR rate limiting check
+function checkPRRateLimit(identifier) {
+  const now = Date.now();
+  const key = `pr_${identifier}`;
+
+  // Clean old entries
+  for (const [k, v] of prRateLimiter.entries()) {
+    if (now - v.timestamp > config.prRateLimitWindow) {
+      prRateLimiter.delete(k);
+    }
+  }
+
+  const entry = prRateLimiter.get(key);
+  if (!entry) {
+    prRateLimiter.set(key, { count: 1, timestamp: now });
+    return true;
+  }
+
+  if (now - entry.timestamp > config.prRateLimitWindow) {
+    prRateLimiter.set(key, { count: 1, timestamp: now });
+    return true;
+  }
+
+  if (entry.count >= config.prRateLimitMax) {
+    return false;
+  }
+
+  entry.count++;
+  return true;
+}
+
+// Tool Registry Pattern
+const toolRegistry = new Map();
+
+// Tool handler functions
+async function handleSearch(args) {
+  const query = safeString(args.query, 200);
+  assert(query.length > 0, 'Search query cannot be empty');
+
+  const repoResponse = await githubRequest("/search/repositories", {
+    q: query,
+    per_page: 5,
+    sort: "stars"
+  });
+
+  const results = repoResponse.items.map(repo => ({
+    id: repo.full_name,
+    title: `${repo.full_name} - ${repo.description || "No description"}`,
+    url: repo.html_url
+  }));
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({ results })
+      }
+    ]
+  };
+}
+
+async function handleFetch(args) {
+  const [owner, repo] = validateRepoFormat(args.id);
+
+  const repoResponse = await githubRequest(`/repos/${owner}/${repo}`);
+  const readmeResponse = await githubRequest(`/repos/${owner}/${repo}/readme`, {}, {
+    Accept: "application/vnd.github.raw"
+  }).catch(() => "No README available");
+
+  const document = {
+    id: repoResponse.full_name,
+    title: repoResponse.name,
+    text: `# ${repoResponse.name}\n\n${repoResponse.description || ""}\n\n` +
+          `Stars: ${repoResponse.stargazers_count}\n` +
+          `Language: ${repoResponse.language || "Unknown"}\n` +
+          `Created: ${repoResponse.created_at}\n\n` +
+          `## README\n\n${readmeResponse}`,
+    url: repoResponse.html_url,
+    metadata: {
+      stars: repoResponse.stargazers_count,
+      language: repoResponse.language,
+      owner: repoResponse.owner.login
+    }
+  };
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(document)
+      }
+    ]
+  };
+}
+
+async function handleListDirectory(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const path = validatePath(args.path);
+  const branch = validateBranch(args.branch);
+
+  try {
+    const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
+      ref: branch
+    });
+
+    const contents = Array.isArray(response) ? response : [response];
+    const items = contents.map(item => ({
+      name: item.name,
+      type: item.type,
+      path: item.path,
+      size: item.size,
+      url: item.html_url
+    }));
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            path: path || "/",
+            items: items
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    // Try with master branch if main fails
+    if (branch === "main") {
+      const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
+        ref: "master"
+      });
+      const contents = Array.isArray(response) ? response : [response];
+      const items = contents.map(item => ({
+        name: item.name,
+        type: item.type,
+        path: item.path,
+        size: item.size,
+        url: item.html_url
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              path: path || "/",
+              items: items
+            })
+          }
+        ]
+      };
+    }
+    throw error;
+  }
+}
+
+async function handleReadFile(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const path = validatePath(args.path);
+  assert(path.length > 0, 'File path cannot be empty');
+  const branch = validateBranch(args.branch);
+
+  try {
+    const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
+      ref: branch
+    }, {
+      Accept: "application/vnd.github.raw"
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            path: path,
+            content: response,
+            url: `https://github.com/${owner}/${repo}/blob/${branch}/${path}`
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    // Try with master branch if main fails
+    if (branch === "main") {
+      const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
+        ref: "master"
+      }, {
+        Accept: "application/vnd.github.raw"
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              path: path,
+              content: response,
+              url: `https://github.com/${owner}/${repo}/blob/master/${path}`
+            })
+          }
+        ]
+      };
+    }
+    throw error;
+  }
+}
+
+async function handleGetTree(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const branch = validateBranch(args.branch);
+
+  try {
+    // Get the branch to find the tree SHA
+    const branchResponse = await githubRequest(`/repos/${owner}/${repo}/branches/${branch}`);
+    const treeSha = branchResponse.commit.commit.tree.sha;
+
+    // Get the tree recursively
+    const treeResponse = await githubRequest(`/repos/${owner}/${repo}/git/trees/${treeSha}`, {
+      recursive: 1
+    });
+
+    const tree = treeResponse.tree.map(item => ({
+      path: item.path,
+      type: item.type,
+      size: item.size
+    }));
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            branch: branch,
+            tree: tree
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    // Try with master branch if main fails
+    if (branch === "main") {
+      const branchResponse = await githubRequest(`/repos/${owner}/${repo}/branches/master`);
+      const treeSha = branchResponse.commit.commit.tree.sha;
+      const treeResponse = await githubRequest(`/repos/${owner}/${repo}/git/trees/${treeSha}`, {
+        recursive: 1
+      });
+
+      const tree = treeResponse.tree.map(item => ({
+        path: item.path,
+        type: item.type,
+        size: item.size
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              branch: "master",
+              tree: tree
+            })
+          }
+        ]
+      };
+    }
+    throw error;
+  }
+}
+
+async function handleGetCommits(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const path = args.path ? validatePath(args.path) : undefined;
+  const limit = Math.min(Math.max(parseInt(args.limit) || 10, 1), 100);
+
+  const params = { per_page: limit };
+  if (path) params.path = path;
+
+  const response = await githubRequest(`/repos/${owner}/${repo}/commits`, params);
+
+  const commits = response.map(commit => ({
+    sha: commit.sha.substring(0, 7),
+    message: commit.commit.message.split('\n')[0],
+    author: commit.commit.author.name,
+    date: commit.commit.author.date,
+    url: commit.html_url
+  }));
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          commits: commits
+        })
+      }
+    ]
+  };
+}
+
+async function handleCreatePullRequest(args) {
+  // Validate PR creation is enabled
+  assert(config.prEnabled, 'PR creation is disabled');
+
+  // Parse and validate repository
+  const [owner, repo] = validateRepoFormat(args.repo);
+
+  // Check whitelist
+  assert(
+    isRepoWhitelisted(owner, repo),
+    `Repository ${owner}/${repo} is not whitelisted for PR creation`
+  );
+
+  // Check rate limit
+  const rateLimitKey = `${owner}/${repo}`;
+  assert(
+    checkPRRateLimit(rateLimitKey),
+    `PR rate limit exceeded for ${owner}/${repo}. Max ${config.prRateLimitMax} PRs per ${config.prRateLimitWindow / 60000} minutes`
+  );
+
+  // Validate required fields
+  const title = safeString(args.title, 200);
+  assert(title && title.length > 0, 'PR title is required');
+
+  const body = safeString(args.body || '', 5000);
+  const base = validateBranch(args.base || 'main');
+  const head = validateBranch(args.head);
+  assert(head && head !== base, 'Head branch is required and must differ from base');
+
+  // Validate PR template if required
+  if (config.prTemplateRequired && !body.includes('[ChatGPT]')) {
+    throw new Error('PR body must include [ChatGPT] tag when template is required');
+  }
+
+  // Log the attempt
+  await auditLog('PR_CREATE_ATTEMPT', {
+    repo: `${owner}/${repo}`,
+    base,
+    head,
+    title,
+    bodyLength: body.length
+  });
+
+  try {
+    // Check if branches exist
+    await githubRequest(`/repos/${owner}/${repo}/branches/${head}`);
+    await githubRequest(`/repos/${owner}/${repo}/branches/${base}`);
+
+    // Create the pull request
+    const prData = {
+      title: `[ChatGPT] ${title}`,
+      body: body || `This pull request was created by ChatGPT via MCP.\n\nHead: ${head}\nBase: ${base}`,
+      head,
+      base,
+      draft: args.draft === true
+    };
+
+    const response = await githubRequest(
+      `/repos/${owner}/${repo}/pulls`,
+      prData,
+      {},
+      'POST'
+    );
+
+    // Log successful creation
+    await auditLog('PR_CREATED', {
+      repo: `${owner}/${repo}`,
+      prNumber: response.number,
+      prUrl: response.html_url,
+      base,
+      head,
+      title
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            pr: {
+              number: response.number,
+              url: response.html_url,
+              title: response.title,
+              state: response.state,
+              draft: response.draft,
+              created_at: response.created_at
+            }
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    // Log failure
+    await auditLog('PR_CREATE_FAILED', {
+      repo: `${owner}/${repo}`,
+      base,
+      head,
+      error: error.message
+    });
+
+    // Provide helpful error messages
+    if (error.message.includes('404')) {
+      throw new Error(`Branch not found. Ensure both '${head}' and '${base}' branches exist in ${owner}/${repo}`);
+    }
+    if (error.message.includes('422')) {
+      throw new Error('PR already exists or invalid PR configuration');
+    }
+    throw error;
+  }
+}
+
+async function handleGetBranches(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+
+  const response = await githubRequest(`/repos/${owner}/${repo}/branches`, {
+    per_page: 100
+  });
+
+  const branches = response.map(branch => ({
+    name: branch.name,
+    protected: branch.protected
+  }));
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify({
+          branches: branches,
+          default: branches.find(b => b.name === "main" || b.name === "master")?.name || branches[0]?.name
+        })
+      }
+    ]
+  };
+}
+
+// Register all tools
+toolRegistry.set("search", handleSearch);
+toolRegistry.set("fetch", handleFetch);
+toolRegistry.set("list_directory", handleListDirectory);
+toolRegistry.set("read_file", handleReadFile);
+toolRegistry.set("get_tree", handleGetTree);
+toolRegistry.set("get_commits", handleGetCommits);
+toolRegistry.set("get_branches", handleGetBranches);
+
+// Register PR tool only if enabled
+if (config.prEnabled && config.prWhitelist.length > 0) {
+  toolRegistry.set("create_pull_request", handleCreatePullRequest);
+}
+
+// Enhanced GitHub API wrapper with caching
+async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET') {
+  const cacheKey = getCacheKey(endpoint, { params, headers, method });
+
+  // Only use cache for GET requests
+  if (method === 'GET') {
+    const cached = getCachedData(cacheKey);
+    if (cached) {
+      console.log(`📦 Cache hit for ${endpoint}`);
+      return cached;
+    }
+  }
+
+  try {
+    console.log(`🌐 ${method} ${endpoint}`);
+    const config = {};
+
+    if (method === 'GET') {
+      config.params = params;
+    } else if (method === 'POST') {
+      config.data = params;
+    }
+
+    if (Object.keys(headers).length > 0) {
+      config.headers = headers;
+    }
+
+    config.method = method;
+
+    const response = await github.request({
+      ...config,
+      url: endpoint
+    });
+
+    // Cache successful responses for GET requests only
+    if (method === 'GET') {
+      setCachedData(cacheKey, response.data);
+    }
+
+    return response.data;
+  } catch (error) {
+    console.error(`❌ GitHub API error for ${method} ${endpoint}:`, error.response?.status, error.message);
+    throw error;
+  }
+}
 
 // MCP endpoint
 app.post("/mcp", async (req, res) => {
@@ -44,7 +770,7 @@ app.post("/mcp", async (req, res) => {
 
     // Handle initialize method
     if (method === "initialize") {
-      return res.json({
+      return res.status(200).json({
         jsonrpc: "2.0",
         id,
         result: {
@@ -63,8 +789,7 @@ app.post("/mcp", async (req, res) => {
 
     // Handle initialized notification
     if (method === "notifications/initialized") {
-      // Just acknowledge the notification
-      return res.json({
+      return res.status(200).json({
         jsonrpc: "2.0",
         result: "ok"
       });
@@ -72,7 +797,7 @@ app.post("/mcp", async (req, res) => {
 
     // List all available tools
     if (method === "tools/list") {
-      return res.json({
+      return res.status(200).json({
         jsonrpc: "2.0",
         id,
         result: {
@@ -210,360 +935,47 @@ app.post("/mcp", async (req, res) => {
 
     // Handle tool calls
     if (method === "tools/call") {
-      const { name, arguments: args } = params;
+      try {
+        const { name, arguments: args } = params;
 
-      // SEARCH tool - search repositories
-      if (name === "search") {
-        const query = args.query;
-        const repoResponse = await github.get("/search/repositories", {
-          params: {
-            q: query,
-            per_page: 5,
-            sort: "stars"
-          }
-        });
+        // Use tool registry for cleaner code organization
+        const toolHandler = toolRegistry.get(name);
 
-        const results = repoResponse.data.items.map(repo => ({
-          id: repo.full_name,
-          title: `${repo.full_name} - ${repo.description || "No description"}`,
-          url: repo.html_url
-        }));
-
-        return res.json({
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({ results })
-              }
-            ]
-          }
-        });
-      }
-
-      // FETCH tool - get repo metadata
-      if (name === "fetch") {
-        const [owner, repo] = args.id.split("/");
-
-        const repoResponse = await github.get(`/repos/${owner}/${repo}`);
-        const readmeResponse = await github.get(`/repos/${owner}/${repo}/readme`, {
-          headers: {
-            Accept: "application/vnd.github.raw"
-          }
-        }).catch(() => ({ data: "No README available" }));
-
-        const document = {
-          id: repoResponse.data.full_name,
-          title: repoResponse.data.name,
-          text: `# ${repoResponse.data.name}\n\n${repoResponse.data.description || ""}\n\n` +
-                `Stars: ${repoResponse.data.stargazers_count}\n` +
-                `Language: ${repoResponse.data.language || "Unknown"}\n` +
-                `Created: ${repoResponse.data.created_at}\n\n` +
-                `## README\n\n${readmeResponse.data}`,
-          url: repoResponse.data.html_url,
-          metadata: {
-            stars: repoResponse.data.stargazers_count,
-            language: repoResponse.data.language,
-            owner: repoResponse.data.owner.login
-          }
-        };
-
-        return res.json({
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify(document)
-              }
-            ]
-          }
-        });
-      }
-
-      // LIST_DIRECTORY tool - browse folder contents
-      if (name === "list_directory") {
-        const [owner, repo] = args.repo.split("/");
-        const path = args.path || "";
-        const branch = args.branch || "main";
-
-        try {
-          const response = await github.get(`/repos/${owner}/${repo}/contents/${path}`, {
-            params: { ref: branch }
-          });
-
-          const contents = Array.isArray(response.data) ? response.data : [response.data];
-          const items = contents.map(item => ({
-            name: item.name,
-            type: item.type,
-            path: item.path,
-            size: item.size,
-            url: item.html_url
-          }));
-
-          return res.json({
+        if (!toolHandler) {
+          return res.status(404).json({
             jsonrpc: "2.0",
             id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    path: path || "/",
-                    items: items
-                  })
-                }
-              ]
+            error: {
+              code: -32601,
+              message: `Unknown tool: ${name}`
             }
           });
-        } catch (error) {
-          // Try with master branch if main fails
-          if (branch === "main") {
-            const response = await github.get(`/repos/${owner}/${repo}/contents/${path}`, {
-              params: { ref: "master" }
-            });
-            const contents = Array.isArray(response.data) ? response.data : [response.data];
-            const items = contents.map(item => ({
-              name: item.name,
-              type: item.type,
-              path: item.path,
-              size: item.size,
-              url: item.html_url
-            }));
-
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      path: path || "/",
-                      items: items
-                    })
-                  }
-                ]
-              }
-            });
-          }
-          throw error;
         }
-      }
 
-      // READ_FILE tool - get file contents
-      if (name === "read_file") {
-        const [owner, repo] = args.repo.split("/");
-        const path = args.path;
-        const branch = args.branch || "main";
+        // Execute tool handler and return result
+        const result = await toolHandler(args);
 
-        try {
-          const response = await github.get(`/repos/${owner}/${repo}/contents/${path}`, {
-            params: { ref: branch },
-            headers: {
-              Accept: "application/vnd.github.raw"
-            }
-          });
-
-          return res.json({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    path: path,
-                    content: response.data,
-                    url: `https://github.com/${owner}/${repo}/blob/${branch}/${path}`
-                  })
-                }
-              ]
-            }
-          });
-        } catch (error) {
-          // Try with master branch if main fails
-          if (branch === "main") {
-            const response = await github.get(`/repos/${owner}/${repo}/contents/${path}`, {
-              params: { ref: "master" },
-              headers: {
-                Accept: "application/vnd.github.raw"
-              }
-            });
-
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      path: path,
-                      content: response.data,
-                      url: `https://github.com/${owner}/${repo}/blob/master/${path}`
-                    })
-                  }
-                ]
-              }
-            });
-          }
-          throw error;
-        }
-      }
-
-      // GET_TREE tool - full repository structure
-      if (name === "get_tree") {
-        const [owner, repo] = args.repo.split("/");
-        const branch = args.branch || "main";
-
-        try {
-          // Get the branch to find the tree SHA
-          const branchResponse = await github.get(`/repos/${owner}/${repo}/branches/${branch}`);
-          const treeSha = branchResponse.data.commit.commit.tree.sha;
-
-          // Get the tree recursively
-          const treeResponse = await github.get(`/repos/${owner}/${repo}/git/trees/${treeSha}`, {
-            params: { recursive: 1 }
-          });
-
-          const tree = treeResponse.data.tree.map(item => ({
-            path: item.path,
-            type: item.type,
-            size: item.size
-          }));
-
-          return res.json({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: JSON.stringify({
-                    branch: branch,
-                    tree: tree
-                  })
-                }
-              ]
-            }
-          });
-        } catch (error) {
-          // Try with master branch if main fails
-          if (branch === "main") {
-            const branchResponse = await github.get(`/repos/${owner}/${repo}/branches/master`);
-            const treeSha = branchResponse.data.commit.commit.tree.sha;
-            const treeResponse = await github.get(`/repos/${owner}/${repo}/git/trees/${treeSha}`, {
-              params: { recursive: 1 }
-            });
-
-            const tree = treeResponse.data.tree.map(item => ({
-              path: item.path,
-              type: item.type,
-              size: item.size
-            }));
-
-            return res.json({
-              jsonrpc: "2.0",
-              id,
-              result: {
-                content: [
-                  {
-                    type: "text",
-                    text: JSON.stringify({
-                      branch: "master",
-                      tree: tree
-                    })
-                  }
-                ]
-              }
-            });
-          }
-          throw error;
-        }
-      }
-
-      // GET_COMMITS tool - recent commit history
-      if (name === "get_commits") {
-        const [owner, repo] = args.repo.split("/");
-        const path = args.path;
-        const limit = args.limit || 10;
-
-        const params = { per_page: limit };
-        if (path) params.path = path;
-
-        const response = await github.get(`/repos/${owner}/${repo}/commits`, { params });
-
-        const commits = response.data.map(commit => ({
-          sha: commit.sha.substring(0, 7),
-          message: commit.commit.message.split('\n')[0],
-          author: commit.commit.author.name,
-          date: commit.commit.author.date,
-          url: commit.html_url
-        }));
-
-        return res.json({
+        return res.status(200).json({
           jsonrpc: "2.0",
           id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  commits: commits
-                })
-              }
-            ]
-          }
-        });
-      }
-
-      // GET_BRANCHES tool - list all branches
-      if (name === "get_branches") {
-        const [owner, repo] = args.repo.split("/");
-
-        const response = await github.get(`/repos/${owner}/${repo}/branches`, {
-          params: { per_page: 100 }
+          result
         });
 
-        const branches = response.data.map(branch => ({
-          name: branch.name,
-          protected: branch.protected
-        }));
-
-        return res.json({
+      } catch (error) {
+        console.error("❌ Tool execution error:", error.message);
+        return res.status(400).json({
           jsonrpc: "2.0",
           id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({
-                  branches: branches,
-                  default: branches.find(b => b.name === "main" || b.name === "master")?.name || branches[0]?.name
-                })
-              }
-            ]
+          error: {
+            code: -32602,
+            message: `Invalid params: ${error.message}`
           }
         });
       }
-
-      // Unknown tool
-      return res.json({
-        jsonrpc: "2.0",
-        id,
-        error: {
-          code: -32601,
-          message: `Unknown tool: ${name}`
-        }
-      });
     }
 
     // Unknown method
-    return res.json({
+    return res.status(501).json({
       jsonrpc: "2.0",
       id,
       error: {
@@ -574,53 +986,115 @@ app.post("/mcp", async (req, res) => {
 
   } catch (error) {
     console.error("❌ Error:", error.message);
-    res.json({
+    return res.status(500).json({
       jsonrpc: "2.0",
-      id: req.body.id,
+      id: req.body?.id || null,
       error: {
         code: -32603,
-        message: error.message
+        message: `Internal error: ${error.message}`
       }
     });
   }
 });
 
-// Health check
+// Enhanced health check
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "GitHub MCP Enhanced v2.0" });
+  try {
+    const healthData = {
+      status: "healthy",
+      service: "GitHub MCP Enhanced v2.0",
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: process.memoryUsage(),
+      version: "2.0.0",
+      capabilities: {
+        tools: Array.from(toolRegistry.keys()),
+        cache_enabled: cache.size >= 0,
+        github_token: !!GITHUB_TOKEN
+      }
+    };
+
+    res.status(200).json(healthData);
+  } catch (error) {
+    res.status(503).json({
+      status: "unhealthy",
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // SSE endpoint for ChatGPT
 app.get("/sse", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*"
-  });
+  try {
+    // Set proper SSE headers
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Cache-Control",
+      "X-Accel-Buffering": "no" // Disable nginx buffering
+    });
 
-  res.write('event: open\n');
-  res.write('data: {"type":"open"}\n\n');
+    // Send initial connection event
+    res.write('event: open\n');
+    res.write('data: {"type":"connection_established","timestamp":"' + new Date().toISOString() + '"}\n\n');
 
-  const interval = setInterval(() => {
-    res.write("event: ping\ndata: {}\n\n");
-  }, 30000);
+    // Keep connection alive with periodic pings
+    const interval = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write("event: ping\n");
+        res.write('data: {"timestamp":"' + new Date().toISOString() + '"}\n\n');
+      } else {
+        clearInterval(interval);
+      }
+    }, 30000);
 
-  req.on("close", () => {
-    clearInterval(interval);
-  });
+    // Clean up on client disconnect
+    req.on("close", () => {
+      clearInterval(interval);
+      console.log("🔌 SSE client disconnected");
+    });
+
+    req.on("error", (error) => {
+      console.error("❌ SSE connection error:", error.message);
+      clearInterval(interval);
+    });
+
+  } catch (error) {
+    console.error("❌ SSE setup error:", error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: "SSE connection failed",
+        message: error.message
+      });
+    }
+  }
 });
 
-// SSE endpoint for MCP messages - handle directly
+// SSE endpoint for MCP messages - streamlined handler
 app.post("/sse", async (req, res) => {
   console.log("📨 SSE MCP Request:", JSON.stringify(req.body, null, 2));
 
   try {
+    // Validate JSON-RPC request structure
+    if (!req.body || !req.body.jsonrpc || !req.body.method) {
+      return res.status(400).json({
+        jsonrpc: "2.0",
+        id: req.body?.id || null,
+        error: {
+          code: -32600,
+          message: "Invalid JSON-RPC request"
+        }
+      });
+    }
+
     const { jsonrpc, method, params, id } = req.body;
 
     // Handle initialize method
     if (method === "initialize") {
-      return res.json({
+      return res.status(200).json({
         jsonrpc: "2.0",
         id,
         result: {
@@ -639,23 +1113,70 @@ app.post("/sse", async (req, res) => {
 
     // Handle initialized notification
     if (method === "notifications/initialized") {
-      return res.json({
+      return res.status(200).json({
         jsonrpc: "2.0",
         result: "ok"
       });
     }
 
-    // Forward other requests to the main handler
-    req.url = "/mcp";
-    app.handle(req, res);
+    // List all available tools
+    if (method === "tools/list") {
+      return res.status(200).json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: Array.from(toolRegistry.keys()).map(name => ({
+            name,
+            description: `GitHub tool: ${name}`,
+            inputSchema: { type: "object" }
+          }))
+        }
+      });
+    }
+
+    // Handle tool calls using registry
+    if (method === "tools/call") {
+      const { name, arguments: args } = params;
+      const toolHandler = toolRegistry.get(name);
+
+      if (!toolHandler) {
+        return res.status(404).json({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32601,
+            message: `Unknown tool: ${name}`
+          }
+        });
+      }
+
+      // Execute tool and return result
+      const result = await toolHandler(args);
+      return res.status(200).json({
+        jsonrpc: "2.0",
+        id,
+        result
+      });
+    }
+
+    // Unknown method
+    return res.status(501).json({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: -32601,
+        message: `Method not found: ${method}`
+      }
+    });
+
   } catch (error) {
     console.error("❌ SSE Error:", error.message);
-    res.json({
+    return res.status(500).json({
       jsonrpc: "2.0",
-      id: req.body?.id || 1,
+      id: req.body?.id || null,
       error: {
         code: -32603,
-        message: error.message
+        message: `Internal error: ${error.message}`
       }
     });
   }
