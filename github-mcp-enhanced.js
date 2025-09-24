@@ -612,6 +612,21 @@ async function handleCreatePullRequest(args) {
     await githubRequest(`/repos/${owner}/${repo}/branches/${head}`);
     await githubRequest(`/repos/${owner}/${repo}/branches/${base}`);
 
+    // Check for existing open PRs from this branch to avoid 422 errors
+    try {
+      const existingPRs = await githubRequest(`/repos/${owner}/${repo}/pulls?head=${owner}:${head}&base=${base}&state=open`);
+      if (existingPRs && existingPRs.length > 0) {
+        const existingPR = existingPRs[0];
+        throw new Error(`PR already exists from ${head} to ${base}. See: ${existingPR.html_url} (PR #${existingPR.number})`);
+      }
+    } catch (prCheckError) {
+      if (prCheckError.message.includes('PR already exists')) {
+        throw prCheckError; // Re-throw our custom error
+      }
+      console.warn('⚠️ Could not check for existing PRs:', prCheckError.message);
+      // Continue with PR creation if check fails
+    }
+
     // Create the pull request
     const prData = {
       title: `[ChatGPT] ${title}`,
@@ -1024,6 +1039,32 @@ app.get("/health", (req, res) => {
   }
 });
 
+// Version endpoint with commit info
+app.get("/version", (req, res) => {
+  const startTime = process.hrtime.bigint();
+  try {
+    const versionData = {
+      name: "github-mcp-enhanced",
+      version: "2.0.0",
+      commit_sha: process.env.GIT_SHA || "dev",
+      build_time: new Date().toISOString(),
+      uptime_seconds: Math.floor(process.uptime()),
+      node_version: process.version,
+      platform: process.platform,
+      tools_count: toolRegistry.size,
+      pr_enabled: config.prEnabled
+    };
+    const endTime = process.hrtime.bigint();
+    versionData.response_time_ns = Number(endTime - startTime);
+    res.status(200).json(versionData);
+  } catch (error) {
+    res.status(500).json({
+      error: "Version info unavailable",
+      message: error.message
+    });
+  }
+});
+
 // SSE endpoint for ChatGPT
 app.get("/sse", (req, res) => {
   try {
@@ -1151,12 +1192,44 @@ app.post("/sse", async (req, res) => {
       }
 
       // Execute tool and return result
-      const result = await toolHandler(args);
-      return res.status(200).json({
-        jsonrpc: "2.0",
-        id,
-        result
-      });
+      try {
+        const result = await toolHandler(args);
+        return res.status(200).json({
+          jsonrpc: "2.0",
+          id,
+          result
+        });
+      } catch (toolError) {
+        // GitHub API errors should be returned as proper JSON-RPC errors, not 500s
+        console.error(`❌ Tool '${name}' error:`, toolError.message);
+
+        // Determine appropriate error code based on the error
+        let errorCode = -32603; // Internal error (default)
+        let statusCode = 200; // JSON-RPC errors use 200 with error object
+
+        if (toolError.message.includes('Request failed with status code 403')) {
+          errorCode = -32001; // Custom: Permission denied
+        } else if (toolError.message.includes('Request failed with status code 404')) {
+          errorCode = -32002; // Custom: Not found
+        } else if (toolError.message.includes('Request failed with status code 422')) {
+          errorCode = -32003; // Custom: Validation error (PR already exists)
+        } else if (toolError.message.includes('rate limit exceeded')) {
+          errorCode = -32004; // Custom: Rate limit exceeded
+        }
+
+        return res.status(statusCode).json({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: errorCode,
+            message: toolError.message,
+            data: {
+              tool: name,
+              timestamp: new Date().toISOString()
+            }
+          }
+        });
+      }
     }
 
     // Unknown method
