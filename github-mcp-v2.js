@@ -843,15 +843,20 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-// SSE endpoint for ChatGPT
-app.get("/sse", (req, res) => {
+// SSE endpoint for ChatGPT (supports both GET and POST)
+const sseHandler = async (req, res) => {
   // Set proper SSE headers
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     "Connection": "keep-alive",
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": "*",
+    "X-Accel-Buffering": "no"  // Disable buffering for immediate response
   });
+
+  console.log("✅ SSE client connected");
+  console.log("Method:", req.method);
+  console.log("Body:", req.body);
 
   // Keep connection alive
   const keepAlive = setInterval(() => {
@@ -864,11 +869,205 @@ app.get("/sse", (req, res) => {
     console.log("🔌 SSE client disconnected");
   });
 
-  console.log("✅ SSE client connected");
+  // Process incoming data if present (from POST body or query params)
+  let requestData = null;
 
-  // Send initial connection message
-  res.write(`data: {"status": "connected"}\n\n`);
-});
+  if (req.method === 'POST' && req.body) {
+    requestData = req.body;
+  } else if (req.query && req.query.data) {
+    try {
+      requestData = JSON.parse(req.query.data);
+    } catch (e) {
+      console.error("Failed to parse query data:", e);
+    }
+  }
+
+  // If we have request data, process it as MCP
+  if (requestData) {
+    try {
+      console.log(`📨 SSE MCP Request:`, requestData);
+      const { method, params, id } = requestData;
+
+      let response;
+
+      // Handle different MCP methods
+      if (method === "initialize") {
+        response = {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            capabilities: {
+              tools: {},
+              resources: {}
+            },
+            serverInfo: {
+              name: "github-mcp-v2",
+              version: "2.0.0"
+            }
+          }
+        };
+      } else if (method === "tools/list") {
+        // Return the same tool list as /mcp endpoint
+        const tools = Array.from(toolRegistry.keys()).map(name => ({
+          name,
+          description: `GitHub tool: ${name}`,
+          inputSchema: getToolSchema(name)
+        }));
+
+        response = {
+          jsonrpc: "2.0",
+          id,
+          result: { tools }
+        };
+      } else if (method === "tools/call") {
+        // Handle tool calls
+        const { name, arguments: args } = params;
+        const handler = toolRegistry.get(name);
+
+        if (!handler) {
+          response = {
+            jsonrpc: "2.0",
+            id,
+            error: {
+              code: -32601,
+              message: `Tool not found: ${name}`
+            }
+          };
+        } else {
+          try {
+            const result = await handler(args);
+            response = {
+              jsonrpc: "2.0",
+              id,
+              result
+            };
+          } catch (error) {
+            response = {
+              jsonrpc: "2.0",
+              id,
+              error: {
+                code: -32000,
+                message: error.message
+              }
+            };
+          }
+        }
+      } else {
+        response = {
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code: -32601,
+            message: `Method not found: ${method}`
+          }
+        };
+      }
+
+      // Send response as SSE data
+      res.write(`data: ${JSON.stringify(response)}\n\n`);
+    } catch (error) {
+      console.error('SSE error:', error);
+      res.write(`data: ${JSON.stringify({
+        jsonrpc: "2.0",
+        id: requestData.id,
+        error: {
+          code: -32000,
+          message: error.message
+        }
+      })}\n\n`);
+    }
+  } else {
+    // For simple GET requests without data, just send connection status
+    res.write(`data: {"status": "connected", "message": "SSE endpoint ready"}\n\n`);
+  }
+};
+
+// Helper function to get tool schema
+const getToolSchema = (name) => {
+  const schemas = {
+    search: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+        sort: { type: "string", enum: ["stars", "forks", "updated"] },
+        order: { type: "string", enum: ["asc", "desc"] },
+        per_page: { type: "number", minimum: 1, maximum: 100 },
+        page: { type: "number", minimum: 1 }
+      },
+      required: ["query"]
+    },
+    fetch: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" }
+      },
+      required: ["repo"]
+    },
+    list_directory: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        path: { type: "string", description: "Directory path" },
+        ref: { type: "string", description: "Branch or commit (default: main)" }
+      },
+      required: ["repo"]
+    },
+    read_file: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        path: { type: "string", description: "File path" },
+        ref: { type: "string", description: "Branch or commit (default: main)" }
+      },
+      required: ["repo", "path"]
+    },
+    get_tree: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        ref: { type: "string", description: "Branch or commit (default: main)" },
+        recursive: { type: "boolean", description: "Get tree recursively" }
+      },
+      required: ["repo"]
+    },
+    get_commits: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        ref: { type: "string", description: "Branch or commit (default: main)" },
+        path: { type: "string", description: "Filter by path" },
+        per_page: { type: "number", minimum: 1, maximum: 100 },
+        page: { type: "number", minimum: 1 }
+      },
+      required: ["repo"]
+    },
+    get_branches: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        per_page: { type: "number", minimum: 1, maximum: 100 },
+        page: { type: "number", minimum: 1 }
+      },
+      required: ["repo"]
+    },
+    create_branch: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "Repository (owner/repo)" },
+        branch: { type: "string", description: "New branch name" },
+        from_ref: { type: "string", description: "Source branch or commit SHA" },
+        fail_if_exists: { type: "boolean", description: "Fail if branch exists" }
+      },
+      required: ["repo", "branch"]
+    }
+  };
+
+  return schemas[name] || { type: "object" };
+};
+
+// Register both GET and POST handlers for SSE
+app.get("/sse", sseHandler);
+app.post("/sse", express.json(), sseHandler);
 
 // Health check
 app.get("/health", async (req, res) => {
