@@ -1,6 +1,7 @@
 # GitHub MCP Server v2.0 — ChatGPT Cheat Sheet
 
-**Server URL:** `https://5855932f66dd.ngrok-free.app/sse`
+**🚀 Permanent Server URL:** `https://github-mcp-server-v2.onrender.com/mcp`
+**Status:** ✅ LIVE and healthy (no more ngrok timeouts!)
 
 ## Quick Reference
 All tools use consistent parameters:

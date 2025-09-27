@@ -684,6 +684,30 @@ app.post("/mcp", async (req, res) => {
       });
     }
 
+    // Handle MCP handshake (for ChatGPT compatibility)
+    if (method === "mcp/handshake") {
+      return res.json({
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocol: "2025-03-26",
+          capabilities: {
+            tools: {
+              supported: true
+            },
+            resources: {
+              supported: false
+            }
+          },
+          serverInfo: {
+            name: "github-mcp-v2",
+            version: "2.0.0",
+            description: "GitHub MCP Server for ChatGPT integration"
+          }
+        }
+      });
+    }
+
     // Handle tool listing
     if (method === "tools/list") {
       const tools = Array.from(toolRegistry.keys()).map(name => {
@@ -841,6 +865,21 @@ app.post("/mcp", async (req, res) => {
       }
     });
   }
+});
+
+// GET handler for /mcp - return 405 Method Not Allowed
+app.get("/mcp", (req, res) => {
+  res.status(405).set({
+    "Access-Control-Allow-Origin": req.headers.origin || "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Allow": "POST, OPTIONS"
+  }).json({
+    error: {
+      code: "MethodNotAllowed",
+      message: "GET method not supported. Use POST for MCP requests.",
+      hint: "This endpoint only accepts POST requests with JSON-RPC payloads."
+    }
+  });
 });
 
 // SSE endpoint for ChatGPT (supports both GET and POST)
