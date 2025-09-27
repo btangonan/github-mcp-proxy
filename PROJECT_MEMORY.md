@@ -2,8 +2,8 @@
 
 ## Project Overview
 **Purpose**: Enable ChatGPT to interact with GitHub repositories through MCP (Model Context Protocol) server
-**Status**: ✅ WORKING - All branch parameter issues resolved
-**Current URL**: `https://2eb8dcfb180a.ngrok-free.app/sse`
+**Status**: ✅ WORKING - Server recovered from CPU overload, token updated
+**Current URL**: `https://5855932f66dd.ngrok-free.app/sse`
 
 ## Key Features Implemented
 1. **PR Creation**: ChatGPT can create pull requests in whitelisted repositories
@@ -94,12 +94,109 @@ curl -s http://localhost:4040/api/tunnels | python3 -c "import json, sys; data =
 - ✅ Implemented branch creation tool with whitelist security
 - ✅ Created missing branches (feat/decouple-analyze-remix, feat/one-click-analyze-remix)
 
+## Enhanced Features (2025-09-24)
+
+### 7. Enhanced PR Creation (NEW)
+**Problem**: PR creation workflow required manual branch creation and file commits
+**Solution**: Enhanced `create_pull_request` with automatic capabilities:
+- **create_branch_if_missing**: Automatically creates head branch from base if it doesn't exist
+- **files array**: Commits files to branch before creating PR
+- **commit_message**: Custom commit message for files
+- **Duplicate prevention**: Always checks for existing open PRs first
+
+### 8. Idempotent Branch Creation (IMPROVED)
+**Problem**: Branch creation failed when branch already existed
+**Solution**: Made `create_branch` idempotent - returns success with existing branch info if it already exists
+
+### 9. File Commit Tool (NEW)
+**Problem**: No way to add files to branches programmatically
+**Solution**: Added `commit_files` tool that:
+- Creates blobs for multiple files
+- Builds a tree with all files
+- Creates a commit with proper author info
+- Updates branch reference to new commit
+
+## Tool Capabilities Summary
+✅ **PR Discovery**: list_pull_requests, search_pull_requests, get_pull_request
+✅ **Branch Operations**: create_branch (idempotent), get_branches
+✅ **File Operations**: commit_files (add/update multiple files)
+✅ **PR Creation**: Enhanced with auto-branch creation and file commits
+✅ **Security**: Repository whitelist, rate limiting, audit logging
+
+## Critical Bug Fixes (2025-09-24 Late Session)
+
+### 10. validateBranch() Default Fallback (FIXED)
+**Problem**: validateBranch() function was defaulting to 'main' when branch parameter was undefined
+**Impact**: All branch creation attempts returned "Branch 'main' already exists" error
+**Solution**: Removed default fallback, now properly throws error when branch is not provided
+```javascript
+// Before (BUG):
+function validateBranch(branch) {
+  if (!branch) return 'main';  // This caused all operations to target 'main'
+  ...
+}
+
+// After (FIXED):
+function validateBranch(branch) {
+  assert(branch, 'Branch name is required');  // Now properly validates
+  ...
+}
+```
+**Result**: Branch creation and commit operations now work correctly with proper branch names
+
+## Critical Bug Fix (2025-09-26)
+
+### 11. Parameter Inconsistency Fix (FIXED)
+**Problem**: `fetch` tool used `id` parameter while all other tools used `repo`, causing ChatGPT confusion
+**Error**: "Repository ID must be a string" when ChatGPT sent `{"repo": "owner/name"}`
+**Solution**: Standardized fetch tool to use `repo` parameter like all other tools
+**Changes**:
+- Line 331: `args.id` → `args.repo` in handleFetch
+- Line 1416: Schema parameter `id` → `repo`
+**Result**: All tools now consistently use `repo` for repository parameter
+
+## ChatGPT Integration Success (2025-09-25)
+
+### 12. Successful ChatGPT Connection (VERIFIED)
+**Status**: ✅ FULLY OPERATIONAL
+**Current Ngrok URL**: `https://5855932f66dd.ngrok-free.app/sse`
+**Client**: openai-mcp v1.0.0 (Ashburn, Virginia - AWS US-East-1)
+
+**Verified Operations**:
+- ✅ SSE connection established
+- ✅ MCP protocol initialized
+- ✅ Tool listing successful
+- ✅ Repository search working (`search` tool)
+- ✅ Directory navigation functional (`list_directory` tool)
+- ✅ File reading operational (`read_file` tool)
+
+**ChatGPT Activity Log**:
+1. Successfully searched: `repo:btangonan/nano-banana-runner runAnalyze.ts`
+2. Successfully searched: `repo:btangonan/nano-banana-runner apps/nn/src/workflows`
+3. Navigated directory tree: `/` → `apps` → `apps/nn` → `apps/nn/apps/gui/src/pages`
+4. Successfully read: `apps/nn/apps/gui/src/pages/UploadAnalyze.tsx` (Gemini image analyzer)
+
+**Tool Call Format Discovered**:
+ChatGPT learned correct parameter format:
+```json
+{
+  "repo": "btangonan/nano-banana-runner",
+  "path": "apps/nn/apps/gui/src/pages/UploadAnalyze.tsx",
+  "branch": "main"
+}
+```
+
+**Notes**:
+- Minor X-Forwarded-For warning from ngrok (non-critical)
+- All core functionality working as expected
+- ChatGPT can now access and analyze the Gemini image analyzer code
+
 ## Next Steps (If Needed)
 - Monitor PR audit log for usage patterns
 - Consider implementing PR update/merge capabilities
 - Implement PR comment functionality
-- Test PR creation on newly created branches
+- Test the enhanced PR creation with file commits
 
 ---
-*Last Updated: 2025-09-24*
-*Session Lead: Added branch creation capability to resolve PR creation failures on non-existent branches*
+*Last Updated: 2025-09-25*
+*Session Lead: Confirmed successful ChatGPT integration and file access to nano-banana-runner repository*

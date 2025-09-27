@@ -1,0 +1,15 @@
+--- github-mcp-v2.js.orig
++++ github-mcp-v2.js
+@@ -145,7 +145,11 @@
+     headers: {
+       Authorization: `Bearer ${config.githubToken}`,
+       Accept: 'application/vnd.github.v3+json',
+-      ...headers
++      // Force GitHub to bypass its own cache
++      'Cache-Control': 'no-cache, no-store, must-revalidate',
++      'Pragma': 'no-cache',
++      'If-None-Match': '', // Explicitly clear ETag to prevent 304 responses
++      ...headers
+     },
+     params,
+     timeout: config.githubApiTimeout

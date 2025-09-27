@@ -145,6 +145,10 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
     headers: {
       Authorization: `Bearer ${config.githubToken}`,
       Accept: 'application/vnd.github.v3+json',
+      // Force GitHub to bypass its own cache
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'If-None-Match': '', // Explicitly clear ETag to prevent 304 responses
       ...headers
     },
     params,
@@ -661,6 +665,13 @@ app.use(express.json({ limit: config.bodySizeLimit }));
 
 // Main MCP endpoint
 app.post("/mcp", async (req, res) => {
+  // Set keep-alive headers to prevent disconnections
+  res.set({
+    'Connection': 'keep-alive',
+    'Keep-Alive': 'timeout=60, max=1000',
+    'X-Content-Type-Options': 'nosniff'
+  });
+
   try {
     const { method, params, id } = req.body;
 

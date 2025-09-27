@@ -241,7 +241,8 @@ function validatePath(path) {
 }
 
 function validateBranch(branch) {
-  if (!branch) return 'main';
+  // Don't default to 'main' - require explicit branch name
+  assert(branch, 'Branch name is required');
   const safeBranch = safeString(branch, 100);
   assert(/^[a-zA-Z0-9._/-]+$/.test(safeBranch), 'Invalid branch name format');
   return safeBranch;
@@ -327,7 +328,7 @@ async function handleSearch(args) {
 }
 
 async function handleFetch(args) {
-  const [owner, repo] = validateRepoFormat(args.id);
+  const [owner, repo] = validateRepoFormat(args.repo);
 
   const repoResponse = await githubRequest(`/repos/${owner}/${repo}`);
   const readmeResponse = await githubRequest(`/repos/${owner}/${repo}/readme`, {}, {
@@ -626,33 +627,124 @@ async function handleCreatePullRequest(args) {
     throw new Error('PR body must include [ChatGPT] tag when template is required');
   }
 
+  // Always check for existing open PRs first to avoid duplicates
+  try {
+    const existingPRs = await githubRequest(`/repos/${owner}/${repo}/pulls?head=${owner}:${head}&base=${base}&state=open`);
+    if (existingPRs && existingPRs.length > 0) {
+      const existingPR = existingPRs[0];
+
+      await auditLog('PR_ALREADY_EXISTS', {
+        repo: `${owner}/${repo}`,
+        base,
+        head,
+        existingPRNumber: existingPR.number,
+        existingPRUrl: existingPR.html_url
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              success: false,
+              exists: true,
+              message: `PR already exists from ${head} to ${base}`,
+              pr: {
+                number: existingPR.number,
+                url: existingPR.html_url,
+                title: existingPR.title,
+                state: existingPR.state,
+                draft: existingPR.draft,
+                created_at: existingPR.created_at
+              }
+            })
+          }
+        ]
+      };
+    }
+  } catch (prCheckError) {
+    console.warn('⚠️ Could not check for existing PRs:', prCheckError.message);
+    // Continue with PR creation if check fails
+  }
+
   // Log the attempt
   await auditLog('PR_CREATE_ATTEMPT', {
     repo: `${owner}/${repo}`,
     base,
     head,
     title,
-    bodyLength: body.length
+    bodyLength: body.length,
+    createBranchIfMissing: args.create_branch_if_missing || false,
+    hasFilesToCommit: args.files ? args.files.length : 0
   });
 
   try {
-    // Check if branches exist
-    await githubRequest(`/repos/${owner}/${repo}/branches/${head}`);
-    await githubRequest(`/repos/${owner}/${repo}/branches/${base}`);
-
-    // Check for existing open PRs from this branch to avoid 422 errors
+    // Check if base branch exists
     try {
-      const existingPRs = await githubRequest(`/repos/${owner}/${repo}/pulls?head=${owner}:${head}&base=${base}&state=open`);
-      if (existingPRs && existingPRs.length > 0) {
-        const existingPR = existingPRs[0];
-        throw new Error(`PR already exists from ${head} to ${base}. See: ${existingPR.html_url} (PR #${existingPR.number})`);
+      await githubRequest(`/repos/${owner}/${repo}/branches/${base}`);
+    } catch (baseError) {
+      throw new Error(`Base branch '${base}' not found in ${owner}/${repo}`);
+    }
+
+    // Check if head branch exists, create if needed and allowed
+    let headExists = false;
+    let branchCreated = false;
+
+    try {
+      await githubRequest(`/repos/${owner}/${repo}/branches/${head}`);
+      headExists = true;
+    } catch (headError) {
+      if (headError.message.includes('404') && args.create_branch_if_missing === true) {
+        // Create the branch from base
+        console.log(`🔄 Head branch '${head}' not found, creating from '${base}'...`);
+
+        try {
+          const branchResult = await handleCreateBranch({
+            repo: args.repo,
+            branch: head,
+            from: base
+          });
+
+          const branchResponse = JSON.parse(branchResult.content[0].text);
+          if (branchResponse.success) {
+            headExists = true;
+            branchCreated = true;
+            console.log(`✅ Branch '${head}' created successfully`);
+          }
+        } catch (createError) {
+          throw new Error(`Failed to create branch '${head}': ${createError.message}`);
+        }
+      } else if (!args.create_branch_if_missing) {
+        throw new Error(`Head branch '${head}' not found. Set create_branch_if_missing: true to auto-create it`);
+      } else {
+        throw headError;
       }
-    } catch (prCheckError) {
-      if (prCheckError.message.includes('PR already exists')) {
-        throw prCheckError; // Re-throw our custom error
+    }
+
+    // If files are provided, commit them to the head branch
+    if (args.files && args.files.length > 0) {
+      if (!headExists) {
+        throw new Error(`Cannot commit files: branch '${head}' does not exist`);
       }
-      console.warn('⚠️ Could not check for existing PRs:', prCheckError.message);
-      // Continue with PR creation if check fails
+
+      console.log(`📝 Committing ${args.files.length} file(s) to branch '${head}'...`);
+
+      try {
+        const commitResult = await handleCommitFiles({
+          repo: args.repo,
+          branch: head,
+          files: args.files,
+          message: args.commit_message || `Add files for PR: ${title}`
+        });
+
+        const commitResponse = JSON.parse(commitResult.content[0].text);
+        if (commitResponse.success) {
+          console.log(`✅ Files committed successfully: ${commitResponse.sha}`);
+        }
+      } catch (commitError) {
+        // If branch was just created, we might want to clean it up
+        throw new Error(`Failed to commit files to '${head}': ${commitError.message}`);
+      }
     }
 
     // Create the pull request
@@ -678,7 +770,9 @@ async function handleCreatePullRequest(args) {
       prUrl: response.html_url,
       base,
       head,
-      title
+      title,
+      branchCreated,
+      filesCommitted: args.files ? args.files.length : 0
     });
 
     return {
@@ -687,6 +781,8 @@ async function handleCreatePullRequest(args) {
           type: "text",
           text: JSON.stringify({
             success: true,
+            branch_created: branchCreated,
+            files_committed: args.files ? args.files.length : 0,
             pr: {
               number: response.number,
               url: response.html_url,
@@ -709,11 +805,14 @@ async function handleCreatePullRequest(args) {
     });
 
     // Provide helpful error messages
-    if (error.message.includes('404')) {
-      throw new Error(`Branch not found. Ensure both '${head}' and '${base}' branches exist in ${owner}/${repo}`);
+    if (error.message.includes('404') && !error.message.includes('branch')) {
+      throw new Error(`Repository or resource not found: ${owner}/${repo}`);
     }
     if (error.message.includes('422')) {
-      throw new Error('PR already exists or invalid PR configuration');
+      throw new Error(`Cannot create PR: ${error.message}. This usually means the PR already exists or there are no differences between branches`);
+    }
+    if (error.message.includes('403')) {
+      throw new Error(`Permission denied. Ensure the GitHub token has 'pull_request:write' permission for ${owner}/${repo}`);
     }
     throw error;
   }
@@ -979,7 +1078,35 @@ async function handleCreateBranch(args) {
   }
 
   try {
-    // Get the base branch (default to main branch)
+    // First check if branch already exists (idempotent)
+    try {
+      const existingBranch = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${branchName}`);
+      if (existingBranch && existingBranch.object && existingBranch.object.sha) {
+        // Branch already exists, return success (idempotent)
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                success: true,
+                exists: true,
+                branch: branchName,
+                sha: existingBranch.object.sha,
+                message: `Branch '${branchName}' already exists`,
+                url: `https://github.com/${owner}/${repo}/tree/${branchName}`
+              })
+            }
+          ]
+        };
+      }
+    } catch (checkError) {
+      // Branch doesn't exist, proceed with creation
+      if (checkError.statusCode !== 404) {
+        throw checkError;
+      }
+    }
+
+    // Get the base branch (default to repository's default branch)
     const baseBranch = args.from || 'main';
 
     // Get the SHA of the base branch
@@ -988,10 +1115,16 @@ async function handleCreateBranch(args) {
       const baseBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${baseBranch}`);
       baseSha = baseBranchData.object.sha;
     } catch (error) {
-      if (error.statusCode === 404 && baseBranch === 'main') {
-        // Try master if main doesn't exist
-        const masterBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/master`);
-        baseSha = masterBranchData.object.sha;
+      if (error.statusCode === 404) {
+        // Try to get default branch from repo info
+        const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
+        const defaultBranch = repoInfo.default_branch;
+        if (baseBranch === 'main' || baseBranch === defaultBranch) {
+          const defaultBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${defaultBranch}`);
+          baseSha = defaultBranchData.object.sha;
+        } else {
+          throw new Error(`Base branch '${baseBranch}' not found`);
+        }
       } else {
         throw error;
       }
@@ -1019,6 +1152,7 @@ async function handleCreateBranch(args) {
         {
           type: "text",
           text: JSON.stringify({
+            success: true,
             branch: branchName,
             from: baseBranch,
             sha: baseSha,
@@ -1036,13 +1170,117 @@ async function handleCreateBranch(args) {
       error: error.message
     });
 
-    if (error.statusCode === 422) {
-      throw new Error(`Branch '${branchName}' already exists in ${owner}/${repo}`);
-    }
     if (error.statusCode === 404) {
-      throw new Error(`Repository ${owner}/${repo} or base branch not found`);
+      throw new Error(`Repository ${owner}/${repo} or base branch not found: ${error.message}`);
     }
-    throw error;
+    throw new Error(`Failed to create branch: ${error.message}`);
+  }
+}
+
+// Handle committing files to a branch
+async function handleCommitFiles(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const branchName = validateBranch(args.branch);
+  assert(branchName, 'Branch name is required');
+  assert(args.message, 'Commit message is required');
+  assert(Array.isArray(args.files) && args.files.length > 0, 'Files array is required');
+
+  // Check whitelist
+  if (config.prWhitelist.length > 0) {
+    const repoPath = `${owner}/${repo}`;
+    const isWhitelisted = config.prWhitelist.some(pattern => {
+      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
+      return regex.test(repoPath);
+    });
+
+    if (!isWhitelisted) {
+      throw new Error(`Repository ${repoPath} is not whitelisted for file commits`);
+    }
+  }
+
+  try {
+    // Get the current branch SHA
+    const branchRef = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${branchName}`);
+    const currentSha = branchRef.object.sha;
+
+    // Get the current tree
+    const currentCommit = await githubRequest(`/repos/${owner}/${repo}/git/commits/${currentSha}`);
+    const baseTreeSha = currentCommit.tree.sha;
+
+    // Create blobs for each file
+    const blobs = await Promise.all(args.files.map(async file => {
+      const content = file.encoding === 'base64' ? file.content : Buffer.from(file.content).toString('base64');
+      const blob = await githubRequest(`/repos/${owner}/${repo}/git/blobs`, {
+        method: 'POST',
+        body: JSON.stringify({
+          content: content,
+          encoding: 'base64'
+        })
+      });
+      return {
+        path: file.path,
+        mode: '100644',
+        type: 'blob',
+        sha: blob.sha
+      };
+    }));
+
+    // Create a new tree with the files
+    const newTree = await githubRequest(`/repos/${owner}/${repo}/git/trees`, {
+      method: 'POST',
+      body: JSON.stringify({
+        base_tree: baseTreeSha,
+        tree: blobs
+      })
+    });
+
+    // Create the commit
+    const newCommit = await githubRequest(`/repos/${owner}/${repo}/git/commits`, {
+      method: 'POST',
+      body: JSON.stringify({
+        message: args.message,
+        tree: newTree.sha,
+        parents: [currentSha]
+      })
+    });
+
+    // Update the branch reference
+    await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${branchName}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        sha: newCommit.sha
+      })
+    });
+
+    await auditLog('FILES_COMMITTED', {
+      repo: `${owner}/${repo}`,
+      branch: branchName,
+      fileCount: args.files.length,
+      sha: newCommit.sha
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            success: true,
+            branch: branchName,
+            commit: newCommit.sha,
+            files: args.files.map(f => f.path),
+            message: `Successfully committed ${args.files.length} file(s) to '${branchName}'`,
+            url: `https://github.com/${owner}/${repo}/commit/${newCommit.sha}`
+          })
+        }
+      ]
+    };
+  } catch (error) {
+    await auditLog('COMMIT_FILES_FAILED', {
+      repo: `${owner}/${repo}`,
+      branch: branchName,
+      error: error.message
+    });
+    throw new Error(`Failed to commit files: ${error.message}`);
   }
 }
 
@@ -1059,6 +1297,7 @@ toolRegistry.set("get_branches", handleGetBranches);
 if (config.prEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("create_pull_request", handleCreatePullRequest);
   toolRegistry.set("create_branch", handleCreateBranch);
+  toolRegistry.set("commit_files", handleCommitFiles);
 }
 
 // Register PR search/list tools (always available for reading)
@@ -1174,12 +1413,12 @@ app.post("/mcp", async (req, res) => {
               inputSchema: {
                 type: "object",
                 properties: {
-                  id: {
+                  repo: {
                     type: "string",
                     description: "Repository name (owner/repo)"
                   }
                 },
-                required: ["id"]
+                required: ["repo"]
               }
             },
             {
@@ -1370,31 +1609,147 @@ app.post("/mcp", async (req, res) => {
         }
       });
 
-      // Add create_branch tool if PR features are enabled
+      // Add PR-related tools if enabled
       if (PR_ENABLED) {
-        result.result.tools.push({
-          name: "create_branch",
-          description: "Create a new branch in a repository from an existing branch or commit. Use this when you need to create feature branches before opening pull requests",
-          inputSchema: {
-            type: "object",
-            properties: {
-              repo: {
-                type: "string",
-                description: "Repository in format owner/repo (e.g., 'octocat/hello-world')"
+        const prTools = [
+          {
+            name: "create_pull_request",
+            description: "Create a pull request in a repository. Automatically checks for existing PRs to prevent duplicates. Can optionally create the head branch if missing and commit files before creating the PR",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: {
+                  type: "string",
+                  description: "Repository in format owner/repo (e.g., 'octocat/hello-world')"
+                },
+                title: {
+                  type: "string",
+                  description: "Title of the pull request"
+                },
+                body: {
+                  type: "string",
+                  description: "Description/body of the pull request"
+                },
+                head: {
+                  type: "string",
+                  description: "The branch containing your changes (e.g., 'feature-branch')"
+                },
+                base: {
+                  type: "string",
+                  description: "The branch you want to merge into (default: repository's default branch)"
+                },
+                draft: {
+                  type: "boolean",
+                  description: "Create as draft PR (default: false)"
+                },
+                create_branch_if_missing: {
+                  type: "boolean",
+                  description: "Create the head branch if it doesn't exist (default: false)"
+                },
+                files: {
+                  type: "array",
+                  description: "Optional files to commit to the branch before creating PR",
+                  items: {
+                    type: "object",
+                    properties: {
+                      path: {
+                        type: "string",
+                        description: "File path relative to repo root"
+                      },
+                      content: {
+                        type: "string",
+                        description: "File content"
+                      },
+                      encoding: {
+                        type: "string",
+                        enum: ["utf8", "base64"],
+                        description: "Content encoding (default: utf8)"
+                      }
+                    },
+                    required: ["path", "content"]
+                  }
+                },
+                commit_message: {
+                  type: "string",
+                  description: "Commit message if files are provided (default: 'Add files for PR: [title]')"
+                }
               },
-              branch: {
-                type: "string",
-                description: "Name for the new branch (e.g., 'feat/new-feature')"
+              required: ["repo", "title", "head"]
+            }
+          },
+          {
+            name: "create_branch",
+            description: "Create a new branch in a repository from an existing branch or commit. Returns success if branch already exists (idempotent)",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: {
+                  type: "string",
+                  description: "Repository in format owner/repo (e.g., 'octocat/hello-world')"
+                },
+                branch: {
+                  type: "string",
+                  description: "Name for the new branch (e.g., 'feat/new-feature')"
+                },
+                from: {
+                  type: "string",
+                  description: "Source branch or commit SHA to branch from (defaults to repository's default branch)"
+                }
               },
-              from: {
-                type: "string",
-                description: "Source branch or commit SHA to branch from (defaults to repository's default branch)"
-              }
-            },
-            required: ["repo", "branch"]
+              required: ["repo", "branch"]
+            }
+          },
+          {
+            name: "commit_files",
+            description: "Commit files to a branch in a repository",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: {
+                  type: "string",
+                  description: "Repository in format owner/repo (e.g., 'octocat/hello-world')"
+                },
+                branch: {
+                  type: "string",
+                  description: "Branch to commit to"
+                },
+                message: {
+                  type: "string",
+                  description: "Commit message"
+                },
+                files: {
+                  type: "array",
+                  description: "Array of files to commit",
+                  items: {
+                    type: "object",
+                    properties: {
+                      path: {
+                        type: "string",
+                        description: "File path in repository"
+                      },
+                      content: {
+                        type: "string",
+                        description: "File content (base64 encoded if binary)"
+                      },
+                      encoding: {
+                        type: "string",
+                        description: "Content encoding: 'utf8' (default) or 'base64'",
+                        enum: ["utf8", "base64"]
+                      }
+                    },
+                    required: ["path", "content"]
+                  }
+                }
+              },
+              required: ["repo", "branch", "message", "files"]
+            }
           }
-        });
+        ];
+
+        result.result.tools.push(...prTools);
       }
+
+      return res.json(result);
     }
 
     // Handle tool calls
@@ -1474,7 +1829,7 @@ app.get("/health", (req, res) => {
       capabilities: {
         tools: Array.from(toolRegistry.keys()),
         cache_enabled: cache.size >= 0,
-        github_token: !!GITHUB_TOKEN
+        github_token: !!config.githubToken
       }
     };
 
