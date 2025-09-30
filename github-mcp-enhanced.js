@@ -1388,7 +1388,7 @@ app.post("/mcp", async (req, res) => {
 
     // List all available tools
     if (method === "tools/list") {
-      return res.status(200).json({
+      const result = {
         jsonrpc: "2.0",
         id,
         result: {
@@ -1607,10 +1607,10 @@ app.post("/mcp", async (req, res) => {
             }
           ]
         }
-      });
+      };
 
       // Add PR-related tools if enabled
-      if (PR_ENABLED) {
+      if (config.prEnabled) {
         const prTools = [
           {
             name: "create_pull_request",
