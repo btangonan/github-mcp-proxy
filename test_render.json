@@ -1,0 +1,13 @@
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "read_file",
+    "arguments": {
+      "repo": "octocat/Hello-World",
+      "path": "README",
+      "ref": "master"
+    }
+  },
+  "id": 1
+}

@@ -364,11 +364,13 @@ async function handleFetch(args) {
 async function handleListDirectory(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = validatePath(args.path);
-  const branch = validateBranch(args.branch);
+  // Use provided branch/ref or default to 'main'
+  const branch = args.branch || args.ref || 'main';
+  const validatedBranch = validateBranch(branch);
 
   try {
     const response = await githubRequest(`/repos/${owner}/${repo}/contents/${path}`, {
-      ref: branch
+      ref: validatedBranch
     });
 
     const contents = Array.isArray(response) ? response : [response];
@@ -501,11 +503,13 @@ async function handleReadFile(args) {
 
 async function handleGetTree(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
-  const branch = validateBranch(args.branch);
+  // Use provided branch/ref or default to 'main'
+  const branch = args.branch || args.ref || 'main';
+  const validatedBranch = validateBranch(branch);
 
   try {
     // Get the branch to find the tree SHA
-    const branchResponse = await githubRequest(`/repos/${owner}/${repo}/branches/${branch}`);
+    const branchResponse = await githubRequest(`/repos/${owner}/${repo}/branches/${validatedBranch}`);
     const treeSha = branchResponse.commit.commit.tree.sha;
 
     // Get the tree recursively
