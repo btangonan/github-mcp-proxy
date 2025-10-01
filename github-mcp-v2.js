@@ -128,7 +128,7 @@ function validateRepoFormat(repo) {
 async function getDefaultBranch(owner, repo) {
   try {
     const response = await githubRequest(`/repos/${owner}/${repo}`);
-    return response.default_branch || 'main';
+    return response.data.default_branch || 'main';
   } catch (error) {
     console.warn(`Failed to get default branch for ${owner}/${repo}, using 'main'`);
     return 'main';
