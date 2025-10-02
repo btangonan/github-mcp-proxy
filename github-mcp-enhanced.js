@@ -364,8 +364,13 @@ async function handleFetch(args) {
 async function handleListDirectory(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = validatePath(args.path);
-  // Use provided branch/ref or default to 'main'
-  const branch = args.branch || args.ref || 'main';
+
+  // Get actual default branch if not specified
+  let branch = args.branch || args.ref;
+  if (!branch) {
+    const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
+    branch = repoInfo.default_branch || 'main';
+  }
   const validatedBranch = validateBranch(branch);
 
   try {
@@ -428,8 +433,13 @@ async function handleReadFile(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = validatePath(args.path);
   assert(path.length > 0, 'File path cannot be empty');
-  // Use provided branch/ref or default to 'main'
-  const branch = args.branch || args.ref || 'main';
+
+  // Get actual default branch if not specified
+  let branch = args.branch || args.ref;
+  if (!branch) {
+    const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
+    branch = repoInfo.default_branch || 'main';
+  }
   const validatedBranch = validateBranch(branch);
 
   // Enhanced logging for debugging
@@ -504,8 +514,13 @@ async function handleReadFile(args) {
 
 async function handleGetTree(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
-  // Use provided branch/ref or default to 'main'
-  const branch = args.branch || args.ref || 'main';
+
+  // Get actual default branch if not specified
+  let branch = args.branch || args.ref;
+  if (!branch) {
+    const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
+    branch = repoInfo.default_branch || 'main';
+  }
   const validatedBranch = validateBranch(branch);
 
   try {
