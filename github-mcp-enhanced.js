@@ -428,7 +428,8 @@ async function handleReadFile(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
   const path = validatePath(args.path);
   assert(path.length > 0, 'File path cannot be empty');
-  const branch = args.branch || args.ref; // Support both branch and ref parameters
+  // Use provided branch/ref or default to 'main'
+  const branch = args.branch || args.ref || 'main';
   const validatedBranch = validateBranch(branch);
 
   // Enhanced logging for debugging
