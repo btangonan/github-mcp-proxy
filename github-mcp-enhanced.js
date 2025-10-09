@@ -47,6 +47,9 @@ const config = {
   prAuditLog: process.env.PR_AUDIT_LOG || './pr_audit.log',
   prTemplateRequired: process.env.PR_TEMPLATE_REQUIRED === 'true',
 
+  // PR update configuration (independent of PR creation)
+  prUpdateEnabled: process.env.PR_UPDATE_ENABLED === 'true',
+
   // PR merge configuration
   prMergeEnabled: process.env.PR_MERGE_ENABLED === 'true',
   prMergeRateLimitMax: parseInt(process.env.PR_MERGE_RATE_LIMIT_MAX) || 5,
@@ -174,25 +177,25 @@ const github = axios.create({
 github.interceptors.response.use(
   (response) => response,
   async (error) => {
-    const config = error.config;
+    const req = error.config;
 
     // Don't retry if we've already retried the configured number of times
-    if (!config || config._retryCount >= config.githubRetryAttempts) {
+    if (!req || req._retryCount >= config.githubRetryAttempts) {
       return Promise.reject(error);
     }
 
-    config._retryCount = config._retryCount || 0;
-    config._retryCount++;
+    req._retryCount = req._retryCount || 0;
+    req._retryCount++;
 
     // Retry on network errors or 5xx status codes
     if (!error.response || (error.response.status >= 500 && error.response.status <= 599)) {
-      console.log(`🔄 Retrying GitHub API request (attempt ${config._retryCount})`);
+      console.log(`🔄 Retrying GitHub API request (attempt ${req._retryCount})`);
 
       // Exponential backoff: 1s, 2s, 4s
-      const delay = Math.pow(2, config._retryCount - 1) * 1000;
+      const delay = Math.pow(2, req._retryCount - 1) * 1000;
       await new Promise(resolve => setTimeout(resolve, delay));
 
-      return github(config);
+      return github(req);
     }
 
     return Promise.reject(error);
@@ -261,17 +264,15 @@ function validateBranch(branch) {
 // Repository whitelist validation
 function isRepoWhitelisted(owner, repo) {
   if (config.prWhitelist.length === 0) return false;
-
-  const fullRepo = `${owner}/${repo}`;
-
-  // Check exact match or pattern match
-  return config.prWhitelist.some(pattern => {
-    if (pattern === fullRepo) return true;
-    if (pattern.endsWith('/*')) {
-      const ownerPattern = pattern.slice(0, -2);
-      return owner === ownerPattern;
-    }
-    return false;
+  const full = `${owner}/${repo}`;
+  return config.prWhitelist.some(pat => {
+    // exact
+    if (pat === full) return true;
+    // owner/* prefix
+    if (pat.endsWith('/*')) return full.startsWith(pat.slice(0, -1));
+    // simple wildcard support
+    const rx = new RegExp('^' + pat.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+    return rx.test(full);
   });
 }
 
@@ -336,6 +337,7 @@ function checkRateLimitCustom(windowMs, maxCount, limiterMap, keyPrefix, identif
   entry.count++;
   return true;
 }
+
 
 // Checks/Statuses summary for a commit SHA
 async function getChecksSummary(owner, repo, sha) {
@@ -1124,11 +1126,12 @@ async function handleGetPullRequest(args) {
 async function handleGetBranches(args) {
   const [owner, repo] = validateRepoFormat(args.repo);
 
-  const response = await githubRequest(`/repos/${owner}/${repo}/branches`, {
-    per_page: 100
-  });
+  const [branchesResp, repoInfo] = await Promise.all([
+    githubRequest(`/repos/${owner}/${repo}/branches`, { per_page: 100 }),
+    githubRequest(`/repos/${owner}/${repo}`)
+  ]);
 
-  const branches = response.map(branch => ({
+  const branches = branchesResp.map(branch => ({
     name: branch.name,
     protected: branch.protected
   }));
@@ -1138,8 +1141,8 @@ async function handleGetBranches(args) {
       {
         type: "text",
         text: JSON.stringify({
-          branches: branches,
-          default: branches.find(b => b.name === "main" || b.name === "master")?.name || branches[0]?.name
+          branches,
+          default: repoInfo.default_branch
         })
       }
     ]
@@ -1151,18 +1154,8 @@ async function handleCreateBranch(args) {
   const branchName = validateBranch(args.branch);
   assert(branchName, 'Branch name is required');
 
-  // Check whitelist for branch creation (same security as PR creation)
-  if (config.prWhitelist.length > 0) {
-    const repoPath = `${owner}/${repo}`;
-    const isWhitelisted = config.prWhitelist.some(pattern => {
-      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
-      return regex.test(repoPath);
-    });
-
-    if (!isWhitelisted) {
-      throw new Error(`Repository ${repoPath} is not whitelisted for branch creation`);
-    }
-  }
+  // Check whitelist for branch creation (reuse central whitelist)
+  assert(isRepoWhitelisted(owner, repo), `Repository ${owner}/${repo} is not whitelisted for branch creation`);
 
   try {
     // First check if branch already exists (idempotent)
@@ -1273,17 +1266,7 @@ async function handleCommitFiles(args) {
   assert(Array.isArray(args.files) && args.files.length > 0, 'Files array is required');
 
   // Check whitelist
-  if (config.prWhitelist.length > 0) {
-    const repoPath = `${owner}/${repo}`;
-    const isWhitelisted = config.prWhitelist.some(pattern => {
-      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
-      return regex.test(repoPath);
-    });
-
-    if (!isWhitelisted) {
-      throw new Error(`Repository ${repoPath} is not whitelisted for file commits`);
-    }
-  }
+  assert(isRepoWhitelisted(owner, repo), `Repository ${owner}/${repo} is not whitelisted for file commits`);
 
   try {
     // Get the current branch SHA
@@ -1367,8 +1350,26 @@ async function handleCommitFiles(args) {
       branch: branchName,
       error: error.message
     });
-    throw new Error(`Failed to commit files: ${error.message}`);
+    throw new Error(explainGitHubError(error, 'commit_files'));
   }
+}
+
+// Helper: wait for GitHub to compute PR.mergeable when it's null
+async function waitForMergeable(owner, repo, prNumber, attempts = 5) {
+  for (let i = 0; i < attempts; i++) {
+    const pr = await (async () => {
+      for (let i = 0; i < 5; i++) {
+        const p = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+        if (p.mergeable !== null) return p;
+        await new Promise(r => setTimeout(r, 800));
+      }
+      return githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+    })();
+    if (pr.mergeable !== null) return pr;
+    await new Promise(r => setTimeout(r, 800));
+  }
+  // Final attempt
+  return githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
 }
 
 // Merge a pull request with safety checks and audit logging
@@ -1396,7 +1397,7 @@ async function handleMergePullRequest(args) {
   const mergeMethod = (args.merge_method || 'squash');
   assert(['merge', 'squash', 'rebase'].includes(mergeMethod), 'Invalid merge_method');
 
-  const pr = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+  const pr = await waitForMergeable(owner, repo, prNumber);
   const headRef = pr.head.ref;
   const headSha = pr.head.sha;
 
@@ -1431,12 +1432,20 @@ async function handleMergePullRequest(args) {
     );
   } catch (e) {
     await auditLog('PR_MERGE_FAILED', { repo: `${owner}/${repo}`, prNumber, error: e.message });
-    throw e;
+    throw new Error(explainGitHubError(e, 'merge_pull_request'));
   }
 
-  // Optional branch delete (non-fatal), avoid deleting base branch
+  // Optional branch delete (non-fatal), avoid deleting base branch and default branch
   let branchDeleted = false;
   if (args.delete_branch === true && headRef !== pr.base.ref) {
+    try {
+      const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
+      if (headRef === repoInfo.default_branch) {
+        throw new Error(`Refusing to delete default branch '${headRef}'`);
+      }
+    } catch (_e) {
+      // proceed if repo info unavailable
+    }
     try {
       await githubRequest(
         `/repos/${owner}/${repo}/git/refs/heads/${headRef}`,
@@ -1477,7 +1486,7 @@ async function handleMergePullRequest(args) {
 
 // Update PR metadata, draft state, base, and optionally add reviewers
 async function handleUpdatePullRequest(args) {
-  assert(config.prEnabled, 'PR updates are disabled');
+  assert(config.prUpdateEnabled, 'PR updates are disabled');
   const [owner, repo] = validateRepoFormat(args.repo);
   assert(isRepoWhitelisted(owner, repo), `Repo ${owner}/${repo} not whitelisted for PR updates`);
 
@@ -1615,9 +1624,13 @@ if (config.prEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("create_pull_request", handleCreatePullRequest);
   toolRegistry.set("create_branch", handleCreateBranch);
   toolRegistry.set("commit_files", handleCommitFiles);
-  toolRegistry.set("update_pull_request", handleUpdatePullRequest);
 }
 
+// Register PR update tool independently
+if (config.prUpdateEnabled && config.prWhitelist.length > 0) {
+  toolRegistry.set("update_pull_request", handleUpdatePullRequest);
+}
+// Register PR update tool independently
 // Register merge tool independently if enabled
 if (config.prMergeEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("merge_pull_request", handleMergePullRequest);
@@ -1680,7 +1693,11 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
 
 // MCP endpoint
 app.post("/mcp", async (req, res) => {
-  console.log("📨 MCP Request:", JSON.stringify(req.body, null, 2));
+  const safeReq = JSON.parse(JSON.stringify(req.body || {}));
+  if (safeReq?.params?.arguments?.body) {
+    safeReq.params.arguments.body = `[${String(safeReq.params.arguments.body).length} chars]`;
+  }
+  console.log("📨 MCP Request:", JSON.stringify(safeReq, null, 2));
 
   try {
     const { jsonrpc, method, params, id } = req.body;
@@ -1763,7 +1780,11 @@ app.post("/mcp", async (req, res) => {
                   },
                   branch: {
                     type: "string",
-                    description: "Branch name (default: main/master)"
+                    description: "Branch name"
+                  },
+                  ref: {
+                    type: "string",
+                    description: "Branch, tag, or commit SHA (alternative to branch)"
                   }
                 },
                 required: ["repo"]
@@ -1785,7 +1806,11 @@ app.post("/mcp", async (req, res) => {
                   },
                   branch: {
                     type: "string",
-                    description: "Branch name (default: main/master)"
+                    description: "Branch name"
+                  },
+                  ref: {
+                    type: "string",
+                    description: "Branch, tag, or commit SHA (alternative to branch)"
                   }
                 },
                 required: ["repo", "path"]
@@ -1803,7 +1828,11 @@ app.post("/mcp", async (req, res) => {
                   },
                   branch: {
                     type: "string",
-                    description: "Branch name (default: main/master)"
+                    description: "Branch name"
+                  },
+                  ref: {
+                    type: "string",
+                    description: "Branch, tag, or commit SHA (alternative to branch)"
                   }
                 },
                 required: ["repo"]
@@ -1822,6 +1851,14 @@ app.post("/mcp", async (req, res) => {
                   path: {
                     type: "string",
                     description: "Optional path to filter commits"
+                  },
+                  branch: {
+                    type: "string",
+                    description: "Branch name"
+                  },
+                  ref: {
+                    type: "string",
+                    description: "Branch, tag, or commit SHA (alternative to branch)"
                   },
                   limit: {
                     type: "number",
@@ -2342,7 +2379,11 @@ app.get("/sse", (req, res) => {
 
 // SSE endpoint for MCP messages - streamlined handler
 app.post("/sse", async (req, res) => {
-  console.log("📨 SSE MCP Request:", JSON.stringify(req.body, null, 2));
+  const safeReq = JSON.parse(JSON.stringify(req.body || {}));
+  if (safeReq?.params?.arguments?.body) {
+    safeReq.params.arguments.body = `[${String(safeReq.params.arguments.body).length} chars]`;
+  }
+  console.log("📨 SSE MCP Request:", JSON.stringify(safeReq, null, 2));
 
   try {
     // Validate JSON-RPC request structure
