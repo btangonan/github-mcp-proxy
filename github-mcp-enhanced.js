@@ -1619,22 +1619,16 @@ toolRegistry.set("get_tree", handleGetTree);
 toolRegistry.set("get_commits", handleGetCommits);
 toolRegistry.set("get_branches", handleGetBranches);
 
-// Register PR/branch tools only if enabled
+// Register PR/branch creation/commit tools only if enabled (guarded by flags/whitelist)
 if (config.prEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("create_pull_request", handleCreatePullRequest);
   toolRegistry.set("create_branch", handleCreateBranch);
   toolRegistry.set("commit_files", handleCommitFiles);
 }
 
-// Register PR update tool independently
-if (config.prUpdateEnabled && config.prWhitelist.length > 0) {
-  toolRegistry.set("update_pull_request", handleUpdatePullRequest);
-}
-// Register PR update tool independently
-// Register merge tool independently if enabled
-if (config.prMergeEnabled && config.prWhitelist.length > 0) {
-  toolRegistry.set("merge_pull_request", handleMergePullRequest);
-}
+// Always expose update/merge handlers; guardrails enforced inside handlers
+toolRegistry.set("update_pull_request", handleUpdatePullRequest);
+toolRegistry.set("merge_pull_request", handleMergePullRequest);
 
 // Register PR search/list tools (always available for reading)
 toolRegistry.set("list_pull_requests", handleListPullRequests);
@@ -2157,56 +2151,77 @@ app.post("/mcp", async (req, res) => {
         result.result.tools.push(...prTools);
       }
 
-      // If PR creation is disabled but merge is enabled, still expose merge tool schema
-      if (!config.prEnabled && config.prMergeEnabled) {
-        result.result.tools.push({
-          name: "merge_pull_request",
-          description: "Merge a pull request after verifying mergeability and branch protections. Does not bypass protections.",
-          inputSchema: {
-            type: "object",
-            properties: {
-              repo: { type: "string", description: "Repository (owner/repo)" },
-              prNumber: { type: "number", description: "Pull request number" },
-              merge_method: { type: "string", enum: ["merge","squash","rebase"], description: "Merge strategy (default: squash)" },
-              commit_title: { type: "string", description: "Optional merge commit title" },
-              commit_message: { type: "string", description: "Optional merge commit message" },
-              sha: { type: "string", description: "Optional head SHA guard for safety" },
-              delete_branch: { type: "boolean", description: "Delete head branch after successful merge (default: false)" }
-            },
-            required: ["repo", "prNumber"]
-          }
-        });
-      }
-
-      // Read helpers are always exposed (avoid duplicates if already added above)
+      // If PR creation is disabled, expose update/merge tools individually when enabled
       if (!config.prEnabled) {
-        result.result.tools.push(
-          {
-            name: "get_pr_mergeability",
-            description: "Get mergeability info and checks summary for a PR",
+        if (config.prMergeEnabled) {
+          result.result.tools.push({
+            name: "merge_pull_request",
+            description: "Merge a pull request if mergeable. Respects protections, flags, whitelist, and rate limits.",
             inputSchema: {
               type: "object",
               properties: {
-                repo: { type: "string", description: "Repository (owner/repo)" },
-                prNumber: { type: "number", description: "Pull request number" }
+                repo: { type: "string", description: "owner/name" },
+                prNumber: { type: "integer" },
+                merge_method: { type: "string", enum: ["merge","squash","rebase"], default: "squash" },
+                sha: { type: "string" },
+                commit_title: { type: "string", maxLength: 256 },
+                commit_message: { type: "string", maxLength: 5000 },
+                delete_branch: { type: "boolean", default: false }
               },
               required: ["repo", "prNumber"]
             }
-          },
-          {
-            name: "get_checks_for_sha",
-            description: "Get combined status and check runs for a commit SHA",
+          });
+        }
+        if (config.prUpdateEnabled) {
+          result.result.tools.push({
+            name: "update_pull_request",
+            description: "Update PR metadata or reviewers.",
             inputSchema: {
               type: "object",
               properties: {
-                repo: { type: "string", description: "Repository (owner/repo)" },
-                sha: { type: "string", description: "Commit SHA (at least 7 characters)" }
+                repo: { type: "string" },
+                prNumber: { type: "integer" },
+                title: { type: "string", maxLength: 256 },
+                body: { type: "string", maxLength: 5000 },
+                state: { type: "string", enum: ["open","closed"] },
+                draft: { type: "boolean" },
+                base: { type: "string" },
+                maintainer_can_modify: { type: "boolean" },
+                reviewers: { type: "array", items: { type: "string" } }
               },
-              required: ["repo", "sha"]
+              required: ["repo","prNumber"]
             }
-          }
-        );
+          });
+        }
       }
+
+      // Read helpers are always exposed
+      result.result.tools.push(
+        {
+          name: "get_pr_mergeability",
+          description: "Fetch PR mergeability, state, and checks summary.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo: { type: "string", description: "owner/name" },
+              prNumber: { type: "integer", description: "Pull request number" }
+            },
+            required: ["repo", "prNumber"]
+          }
+        },
+        {
+          name: "get_checks_for_sha",
+          description: "Get combined statuses and check runs for a commit SHA.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo: { type: "string", description: "owner/name" },
+              sha: { type: "string", description: "Commit SHA (at least 7 characters)" }
+            },
+            required: ["repo", "sha"]
+          }
+        }
+      );
 
       return res.json(result);
     }
