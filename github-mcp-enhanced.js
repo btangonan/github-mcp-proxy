@@ -2304,6 +2304,12 @@ app.get("/health", (req, res) => {
         tools: Array.from(toolRegistry.keys()),
         cache_enabled: cache.size >= 0,
         github_token: !!config.githubToken
+      },
+      config: {
+        prEnabled: config.prEnabled,
+        prMergeEnabled: config.prMergeEnabled,
+        prUpdateEnabled: config.prUpdateEnabled,
+        prWhitelist: config.prWhitelist
       }
     };
 
