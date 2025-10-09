@@ -45,7 +45,12 @@ const config = {
   prRateLimitMax: parseInt(process.env.PR_RATE_LIMIT_MAX) || 5,
   prRateLimitWindow: parseInt(process.env.PR_RATE_LIMIT_WINDOW) || 60 * 60 * 1000, // 1 hour
   prAuditLog: process.env.PR_AUDIT_LOG || './pr_audit.log',
-  prTemplateRequired: process.env.PR_TEMPLATE_REQUIRED === 'true'
+  prTemplateRequired: process.env.PR_TEMPLATE_REQUIRED === 'true',
+
+  // PR merge configuration
+  prMergeEnabled: process.env.PR_MERGE_ENABLED === 'true',
+  prMergeRateLimitMax: parseInt(process.env.PR_MERGE_RATE_LIMIT_MAX) || 5,
+  prMergeRateLimitWindow: parseInt(process.env.PR_MERGE_RATE_LIMIT_WINDOW) || 60 * 60 * 1000 // 1 hour
 };
 
 // Validate required configuration
@@ -63,6 +68,10 @@ if (config.prEnabled) {
   console.log(`   • PR Creation: ENABLED`);
   console.log(`   • PR Whitelist: ${config.prWhitelist.length > 0 ? config.prWhitelist.join(', ') : 'None (disabled)'}`);
   console.log(`   • PR Rate Limit: ${config.prRateLimitMax} per ${config.prRateLimitWindow / 60000} minutes`);
+}
+if (config.prMergeEnabled) {
+  console.log(`   • PR Merge: ENABLED`);
+  console.log(`   • PR Merge Rate Limit: ${config.prMergeRateLimitMax} per ${config.prMergeRateLimitWindow / 60000} minutes`);
 }
 console.log("");
 
@@ -113,6 +122,7 @@ const cache = new Map();
 
 // PR rate limiting tracker
 const prRateLimiter = new Map();
+const prMergeRateLimiter = new Map();
 
 // Audit logging for PR operations
 const fs = require('fs').promises;
@@ -250,7 +260,6 @@ function validateBranch(branch) {
 
 // Repository whitelist validation
 function isRepoWhitelisted(owner, repo) {
-  if (!config.prEnabled) return false;
   if (config.prWhitelist.length === 0) return false;
 
   const fullRepo = `${owner}/${repo}`;
@@ -295,6 +304,64 @@ function checkPRRateLimit(identifier) {
 
   entry.count++;
   return true;
+}
+
+// Generic rate limit helper
+function checkRateLimitCustom(windowMs, maxCount, limiterMap, keyPrefix, identifier) {
+  const now = Date.now();
+  const key = `${keyPrefix}_${identifier}`;
+
+  // Clean old entries
+  for (const [k, v] of limiterMap.entries()) {
+    if (now - v.timestamp > windowMs) {
+      limiterMap.delete(k);
+    }
+  }
+
+  const entry = limiterMap.get(key);
+  if (!entry) {
+    limiterMap.set(key, { count: 1, timestamp: now });
+    return true;
+  }
+
+  if (now - entry.timestamp > windowMs) {
+    limiterMap.set(key, { count: 1, timestamp: now });
+    return true;
+  }
+
+  if (entry.count >= maxCount) {
+    return false;
+  }
+
+  entry.count++;
+  return true;
+}
+
+// Checks/Statuses summary for a commit SHA
+async function getChecksSummary(owner, repo, sha) {
+  // Combined status (legacy statuses)
+  const status = await githubRequest(`/repos/${owner}/${repo}/commits/${sha}/status`);
+  // GitHub Checks API (requires proper Accept header)
+  const checks = await githubRequest(
+    `/repos/${owner}/${repo}/commits/${sha}/check-runs`,
+    {},
+    { Accept: 'application/vnd.github+json' },
+    'GET'
+  );
+
+  const failingStatuses = (status.statuses || [])
+    .filter(s => s.state !== 'success')
+    .map(s => s.context);
+
+  const failingChecks = (checks.check_runs || [])
+    .filter(c => ['failure','timed_out','cancelled','action_required'].includes(c.conclusion))
+    .map(c => c.name);
+
+  const message = (failingStatuses.length === 0 && failingChecks.length === 0)
+    ? 'Merge blocked by protections or review requirements.'
+    : `Failing: ${[...failingStatuses, ...failingChecks].join(', ')}`;
+
+  return { status, checks, message };
 }
 
 // Tool Registry Pattern
@@ -1304,6 +1371,236 @@ async function handleCommitFiles(args) {
   }
 }
 
+// Merge a pull request with safety checks and audit logging
+async function handleMergePullRequest(args) {
+  assert(config.prMergeEnabled, 'PR merge is disabled');
+  const [owner, repo] = validateRepoFormat(args.repo);
+  assert(isRepoWhitelisted(owner, repo), `Repo ${owner}/${repo} not whitelisted for PR merge`);
+
+  // rate limit merges separately
+  const key = `${owner}/${repo}`;
+  assert(
+    checkRateLimitCustom(
+      config.prMergeRateLimitWindow,
+      config.prMergeRateLimitMax,
+      prMergeRateLimiter,
+      'merge',
+      key
+    ),
+    `Merge rate limit exceeded for ${owner}/${repo}`
+  );
+
+  const prNumber = parseInt(args.prNumber);
+  assert(!isNaN(prNumber) && prNumber > 0, 'Valid prNumber required');
+
+  const mergeMethod = (args.merge_method || 'squash');
+  assert(['merge', 'squash', 'rebase'].includes(mergeMethod), 'Invalid merge_method');
+
+  const pr = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+  const headRef = pr.head.ref;
+  const headSha = pr.head.sha;
+
+  // Optional SHA guard for safety
+  if (args.sha) {
+    assert(args.sha === headSha, `Head SHA mismatch. Expected ${headSha}, got ${args.sha}`);
+  }
+
+  if (pr.mergeable !== true) {
+    const checks = await getChecksSummary(owner, repo, headSha);
+    await auditLog('PR_MERGE_BLOCKED', {
+      repo: `${owner}/${repo}`,
+      prNumber,
+      mergeable_state: pr.mergeable_state,
+      checks
+    });
+    throw new Error(`PR not mergeable: ${pr.mergeable_state}. ${checks.message}`);
+  }
+
+  const body = { merge_method: mergeMethod };
+  if (args.commit_title) body.commit_title = safeString(args.commit_title, 256);
+  if (args.commit_message) body.commit_message = safeString(args.commit_message, 5000);
+  if (args.sha) body.sha = args.sha;
+
+  let mergeResp;
+  try {
+    mergeResp = await githubRequest(
+      `/repos/${owner}/${repo}/pulls/${prNumber}/merge`,
+      body,
+      {},
+      'PUT'
+    );
+  } catch (e) {
+    await auditLog('PR_MERGE_FAILED', { repo: `${owner}/${repo}`, prNumber, error: e.message });
+    throw e;
+  }
+
+  // Optional branch delete (non-fatal), avoid deleting base branch
+  let branchDeleted = false;
+  if (args.delete_branch === true && headRef !== pr.base.ref) {
+    try {
+      await githubRequest(
+        `/repos/${owner}/${repo}/git/refs/heads/${headRef}`,
+        {},
+        {},
+        'DELETE'
+      );
+      branchDeleted = true;
+    } catch (e) {
+      // ignore delete failures
+    }
+  }
+
+  await auditLog('PR_MERGED', {
+    repo: `${owner}/${repo}`,
+    prNumber,
+    method: mergeMethod,
+    sha: headSha,
+    branchDeleted
+  });
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          merged: mergeResp.merged,
+          message: mergeResp.message,
+          sha: mergeResp.sha,
+          commit_url: mergeResp.commit_url,
+          branch_deleted: branchDeleted
+        })
+      }
+    ]
+  };
+}
+
+// Update PR metadata, draft state, base, and optionally add reviewers
+async function handleUpdatePullRequest(args) {
+  assert(config.prEnabled, 'PR updates are disabled');
+  const [owner, repo] = validateRepoFormat(args.repo);
+  assert(isRepoWhitelisted(owner, repo), `Repo ${owner}/${repo} not whitelisted for PR updates`);
+
+  const prNumber = parseInt(args.prNumber);
+  assert(!isNaN(prNumber) && prNumber > 0, 'Valid prNumber required');
+
+  const patch = {};
+  if (args.title) patch.title = safeString(args.title, 256);
+  if (args.body) patch.body = safeString(args.body, 5000);
+  if (args.state) patch.state = args.state; // "open" | "closed"
+  if (typeof args.draft === 'boolean') patch.draft = args.draft;
+  if (args.base) patch.base = validateBranch(args.base);
+  if (typeof args.maintainer_can_modify === 'boolean') patch.maintainer_can_modify = args.maintainer_can_modify;
+
+  let updated = null;
+  if (Object.keys(patch).length > 0) {
+    updated = await githubRequest(
+      `/repos/${owner}/${repo}/pulls/${prNumber}`,
+      patch,
+      {},
+      'PATCH'
+    );
+  } else {
+    updated = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+  }
+
+  // Optional: reviewers
+  let reviewersAdded = null;
+  if (Array.isArray(args.reviewers) && args.reviewers.length > 0) {
+    reviewersAdded = await githubRequest(
+      `/repos/${owner}/${repo}/pulls/${prNumber}/requested_reviewers`,
+      { reviewers: args.reviewers },
+      {},
+      'POST'
+    );
+  }
+
+  await auditLog('PR_UPDATED', {
+    repo: `${owner}/${repo}`,
+    prNumber,
+    fields: Object.keys(patch),
+    reviewers: args.reviewers?.length || 0
+  });
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          pr: {
+            number: updated.number,
+            title: updated.title,
+            draft: updated.draft,
+            state: updated.state,
+            base: updated.base.ref
+          },
+          reviewers_added: reviewersAdded ? reviewersAdded.requested_reviewers.map(r => r.login) : []
+        })
+      }
+    ]
+  };
+}
+
+// Read helper: get PR mergeability with checks summary
+async function handleGetPRMergeability(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const prNumber = parseInt(args.prNumber);
+  assert(!isNaN(prNumber) && prNumber > 0, 'Valid prNumber required');
+  const pr = await githubRequest(`/repos/${owner}/${repo}/pulls/${prNumber}`);
+  const checks = await getChecksSummary(owner, repo, pr.head.sha);
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          number: pr.number,
+          mergeable: pr.mergeable,
+          mergeable_state: pr.mergeable_state,
+          head_sha: pr.head.sha,
+          base: pr.base.ref,
+          head: pr.head.ref,
+          checks: { message: checks.message }
+        })
+      }
+    ]
+  };
+}
+
+// Read helper: get checks and statuses for a commit SHA
+async function handleGetChecksForSha(args) {
+  const [owner, repo] = validateRepoFormat(args.repo);
+  const sha = safeString(args.sha, 100);
+  assert(sha && sha.length >= 7, 'Valid sha required');
+
+  const status = await githubRequest(`/repos/${owner}/${repo}/commits/${sha}/status`);
+  const checks = await githubRequest(
+    `/repos/${owner}/${repo}/commits/${sha}/check-runs`,
+    {},
+    { Accept: 'application/vnd.github+json' },
+    'GET'
+  );
+
+  const failingStatuses = (status.statuses || []).filter(s => s.state !== 'success').map(s => s.context);
+  const failingChecks = (checks.check_runs || []).filter(c => ['failure','timed_out','cancelled','action_required'].includes(c.conclusion)).map(c => c.name);
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          sha,
+          state: status.state,
+          total_statuses: (status.statuses || []).length,
+          total_checks: (checks.check_runs || []).length,
+          failing: [...failingStatuses, ...failingChecks],
+          details_url: status.repository?.html_url ? `${status.repository.html_url}/commit/${sha}/checks` : undefined
+        })
+      }
+    ]
+  };
+}
+
 // Register all tools
 toolRegistry.set("search", handleSearch);
 toolRegistry.set("fetch", handleFetch);
@@ -1318,12 +1615,20 @@ if (config.prEnabled && config.prWhitelist.length > 0) {
   toolRegistry.set("create_pull_request", handleCreatePullRequest);
   toolRegistry.set("create_branch", handleCreateBranch);
   toolRegistry.set("commit_files", handleCommitFiles);
+  toolRegistry.set("update_pull_request", handleUpdatePullRequest);
+}
+
+// Register merge tool independently if enabled
+if (config.prMergeEnabled && config.prWhitelist.length > 0) {
+  toolRegistry.set("merge_pull_request", handleMergePullRequest);
 }
 
 // Register PR search/list tools (always available for reading)
 toolRegistry.set("list_pull_requests", handleListPullRequests);
 toolRegistry.set("search_pull_requests", handleSearchPullRequests);
 toolRegistry.set("get_pull_request", handleGetPullRequest);
+toolRegistry.set("get_pr_mergeability", handleGetPRMergeability);
+toolRegistry.set("get_checks_for_sha", handleGetChecksForSha);
 
 // Enhanced GitHub API wrapper with caching
 async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET') {
@@ -1345,7 +1650,8 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
 
     if (method === 'GET') {
       config.params = params;
-    } else if (method === 'POST') {
+    } else {
+      // Support bodies for POST, PUT, PATCH, DELETE where applicable
       config.data = params;
     }
 
@@ -1766,7 +2072,103 @@ app.post("/mcp", async (req, res) => {
           }
         ];
 
+        // Extend PR tools with update and, if enabled, merge
+        prTools.push({
+          name: "update_pull_request",
+          description: "Update a pull request: flip draft (ready-for-review), edit title/body/base/state, optionally add reviewers",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo: { type: "string", description: "Repository (owner/repo)" },
+              prNumber: { type: "number", description: "Pull request number" },
+              title: { type: "string", description: "New title" },
+              body: { type: "string", description: "New body/description" },
+              state: { type: "string", description: "PR state: open|closed" },
+              draft: { type: "boolean", description: "Set draft state (false to mark ready for review)" },
+              base: { type: "string", description: "Change base branch" },
+              maintainer_can_modify: { type: "boolean", description: "Allow maintainers to modify" },
+              reviewers: {
+                type: "array",
+                description: "Logins to request review from",
+                items: { type: "string" }
+              }
+            },
+            required: ["repo", "prNumber"]
+          }
+        });
+
+        if (config.prMergeEnabled) {
+          prTools.push({
+            name: "merge_pull_request",
+            description: "Merge a pull request after verifying mergeability and branch protections. Does not bypass protections.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: { type: "string", description: "Repository (owner/repo)" },
+                prNumber: { type: "number", description: "Pull request number" },
+                merge_method: { type: "string", enum: ["merge","squash","rebase"], description: "Merge strategy (default: squash)" },
+                commit_title: { type: "string", description: "Optional merge commit title" },
+                commit_message: { type: "string", description: "Optional merge commit message" },
+                sha: { type: "string", description: "Optional head SHA guard for safety" },
+                delete_branch: { type: "boolean", description: "Delete head branch after successful merge (default: false)" }
+              },
+              required: ["repo", "prNumber"]
+            }
+          });
+        }
+
         result.result.tools.push(...prTools);
+      }
+
+      // If PR creation is disabled but merge is enabled, still expose merge tool schema
+      if (!config.prEnabled && config.prMergeEnabled) {
+        result.result.tools.push({
+          name: "merge_pull_request",
+          description: "Merge a pull request after verifying mergeability and branch protections. Does not bypass protections.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              repo: { type: "string", description: "Repository (owner/repo)" },
+              prNumber: { type: "number", description: "Pull request number" },
+              merge_method: { type: "string", enum: ["merge","squash","rebase"], description: "Merge strategy (default: squash)" },
+              commit_title: { type: "string", description: "Optional merge commit title" },
+              commit_message: { type: "string", description: "Optional merge commit message" },
+              sha: { type: "string", description: "Optional head SHA guard for safety" },
+              delete_branch: { type: "boolean", description: "Delete head branch after successful merge (default: false)" }
+            },
+            required: ["repo", "prNumber"]
+          }
+        });
+      }
+
+      // Read helpers are always exposed (avoid duplicates if already added above)
+      if (!config.prEnabled) {
+        result.result.tools.push(
+          {
+            name: "get_pr_mergeability",
+            description: "Get mergeability info and checks summary for a PR",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: { type: "string", description: "Repository (owner/repo)" },
+                prNumber: { type: "number", description: "Pull request number" }
+              },
+              required: ["repo", "prNumber"]
+            }
+          },
+          {
+            name: "get_checks_for_sha",
+            description: "Get combined status and check runs for a commit SHA",
+            inputSchema: {
+              type: "object",
+              properties: {
+                repo: { type: "string", description: "Repository (owner/repo)" },
+                sha: { type: "string", description: "Commit SHA (at least 7 characters)" }
+              },
+              required: ["repo", "sha"]
+            }
+          }
+        );
       }
 
       return res.json(result);

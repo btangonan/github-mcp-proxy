@@ -191,12 +191,62 @@ ChatGPT learned correct parameter format:
 - All core functionality working as expected
 - ChatGPT can now access and analyze the Gemini image analyzer code
 
+## Critical Bug Fix (2025-10-01)
+
+### 13. ChatGPT Tool Failures - Branch Handling Bug (FIXED)
+**Problem**: ChatGPT reported HTTP 400 errors when using `read_file`, `list_directory`, `get_tree` tools
+**Root Causes**:
+1. `validateBranch()` in github-mcp-enhanced.js required branch parameter, threw error when undefined
+2. Tools defaulting to hardcoded `'main'` instead of fetching actual repo default branch
+3. Repos like octocat/Hello-World use `'master'`, causing 404→400 errors
+
+**Solution**:
+- Fixed `validateBranch()` - added default branch fallback before validation
+- Implemented actual default branch detection from GitHub API
+- Pattern: `if (!branch) { repoInfo = await githubRequest('/repos/owner/repo'); branch = repoInfo.default_branch || 'main'; }`
+
+**Commits**:
+- `93bdc6f` - Fixed github-mcp-v2.js getDefaultBranch() data access
+- `8be8f34` - Fixed validateBranch requiring branch parameter
+- `52739d2` - Fixed read_file missing default branch fallback
+- `9414ee9` - Use actual repo default branch (not hardcoded 'main')
+
+**Files Modified**:
+- `github-mcp-enhanced.js:369-374` - handleListDirectory() default branch detection
+- `github-mcp-enhanced.js:433-437` - handleReadFile() default branch detection
+- `github-mcp-enhanced.js:519-523` - handleGetTree() default branch detection
+
+**Result**: ✅ All tools working without explicit branch parameters, auto-detects correct default branch
+
+## Key Learnings
+
+### Architecture
+- Project has TWO server versions: github-mcp-v2.js and github-mcp-enhanced.js
+- Render deploys: **github-mcp-enhanced.js** (via package.json main entry)
+- Different implementations: v2 returns `{data, meta}`, enhanced returns `data` directly
+
+### Default Branch Handling
+- **Never assume 'main'** - older repos use 'master', some use 'develop' or custom defaults
+- **Always fetch actual default**: `repoInfo.default_branch` from `/repos/:owner/:repo`
+- **Pattern**: Check args.branch → args.ref → fetch default → validate
+
+### Render Deployment
+- Auto-deploy may be delayed or require manual trigger
+- Verify deployment by checking `/health` endpoint uptime (resets on deploy)
+- Use `mcp__render__list_logs` with text filters for live debugging
+
+### Tool Testing
+- Test with: `curl POST /mcp` with JSON-RPC payload
+- Success: `{"result": {...}}`, Failure: `{"error": {...}}`
+- Created `test_live_server.sh` for automated testing
+
 ## Next Steps (If Needed)
 - Monitor PR audit log for usage patterns
 - Consider implementing PR update/merge capabilities
 - Implement PR comment functionality
 - Test the enhanced PR creation with file commits
+- Add ChromaDB memories when server available (see CHROMA_MEMORIES.md)
 
 ---
-*Last Updated: 2025-09-25*
-*Session Lead: Confirmed successful ChatGPT integration and file access to nano-banana-runner repository*
+*Last Updated: 2025-10-01*
+*Session Lead: Fixed ChatGPT tool failures - all tools now working with automatic default branch detection*

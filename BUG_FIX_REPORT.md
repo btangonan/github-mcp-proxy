@@ -132,18 +132,32 @@ list_directory({ repo: "octocat/Hello-World", path: "" })
 ## Deployment Steps
 
 1. ✅ Fix applied to `github-mcp-v2.js` (line 131)
-2. ✅ Verified `github-mcp-enhanced.js` - no bug (different implementation)
-3. ⏳ Deploy fixed `github-mcp-v2.js` to Render
-4. ⏳ Test with ChatGPT - verify all tools work
-5. ⏳ Monitor Render logs for successful file/directory operations
+2. ✅ Verified `github-mcp-enhanced.js` - had DIFFERENT bug (validateBranch requiring branch)
+3. ✅ Fixed `github-mcp-enhanced.js` - added default branch fallback
+4. ✅ Fixed hardcoded 'main' - now uses actual repo default branch
+5. ✅ Deployed to Render - all tools working
+6. ✅ Tested with ChatGPT - **ALL TOOLS PASSING** 🎉
 
 ### Which Server is Deployed?
 
-According to SOLUTION_MEMORY.md (line 44-45):
-- Render uses: **github-mcp-v2.js** ← THIS IS THE ONE WITH THE BUG
-- Local uses: **github-mcp-enhanced.js** (via package.json)
+According to package.json:
+- Render uses: **github-mcp-enhanced.js** (main entry point)
+- Local also uses: **github-mcp-enhanced.js**
 
-**Action Required**: Deploy fixed `github-mcp-v2.js` to Render
+### Additional Fixes Required
+
+**Enhanced.js specific issues:**
+1. ✅ Line 245: `validateBranch()` required branch parameter
+2. ✅ Line 367-374: Added default branch detection to `handleListDirectory()`
+3. ✅ Line 431-438: Added default branch detection to `handleReadFile()`
+4. ✅ Line 518-524: Added default branch detection to `handleGetTree()`
+5. ✅ Final: Fetch actual default branch from repo API instead of hardcoding 'main'
+
+**Final Commits:**
+- `93bdc6f` - Fixed github-mcp-v2.js getDefaultBranch()
+- `8be8f34` - Fixed validateBranch in github-mcp-enhanced.js
+- `52739d2` - Fixed read_file missing default branch
+- `9414ee9` - Use actual repo default branch (not hardcoded 'main')
 
 ## Prevention
 

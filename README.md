@@ -10,6 +10,7 @@ A fully functional MCP (Model Context Protocol) server that enables ChatGPT to b
 - 🌳 **View** full repository structures
 - 📜 **Access** commit history
 - 🌿 **List** repository branches
+- 🔧 **PR tools**: create, update (ready-for-review), and merge (optional, guarded, whitelisted)
 - 🔒 **Secure**: Your PAT stays on your local machine
 
 ## Prerequisites
@@ -101,27 +102,32 @@ Start a new chat with the connector enabled:
 | `get_commits` | Recent commit history | "Show last 10 commits" |
 | `get_branches` | List all branches | "What branches exist?" |
 | `create_pull_request` | Create PRs (requires setup) | "Create PR from feature-branch" |
+| `update_pull_request` | Edit PR title/body, change draft, add reviewers | "Mark PR #123 ready for review" |
+| `merge_pull_request` | Merge PR with merge/squash/rebase, optional delete branch | "Squash-merge PR #123 and delete branch" |
+| `get_pr_mergeability` | PR mergeable state and checks summary | "Is PR #123 mergeable?" |
+| `get_checks_for_sha` | Combined status and check runs for a commit | "Checks for sha abcdef1" |
 
 ## How It Works
 
 1. **Local MCP Server**: Implements the Model Context Protocol with GitHub API integration
 2. **ngrok Tunnel**: Provides the public HTTPS URL that ChatGPT requires
 3. **GitHub API**: Server uses your PAT to fetch repository data
-4. **MCP Tools**: Eight specialized tools for different GitHub operations
+4. **MCP Tools**: Tools for browsing and PR workflows (create/update/merge)
 
-## 🎯 PR Creation Feature (Optional)
+## 🎯 PR Features (Create, Update, Merge) — Optional
 
-The server includes an **optional** PR creation capability that's **disabled by default** for security. This allows ChatGPT to create pull requests from existing branches in whitelisted repositories.
+The server includes **optional PR tools** (create, update, merge) that are **disabled by default** for security. Merges respect branch protections and required checks; protections are never bypassed.
 
 ### Security Design
 
 The PR feature implements multiple security layers:
 - **Disabled by default** - Requires explicit opt-in
-- **Repository whitelist** - Only specified repos can have PRs created
-- **Branch validation** - Can only create PRs from existing branches
-- **No commit access** - Cannot create or modify commits
-- **Rate limiting** - Separate limits for PR operations
-- **Audit logging** - All PR attempts are logged
+- **Repository whitelist** - Only specified repos can have PRs created/updated/merged
+- **Branch validation** - Actions occur on explicitly named branches
+- **No direct pushes** - Changes only via PRs or the explicit `commit_files` tool when allowed
+- **Rate limiting** - Separate limits for PR operations and merges
+- **Audit logging** - All PR attempts and merges are logged
+- **Token scopes** - PAT must have `repo` (classic) or fine-grained "Pull requests: Read and write"; orgs may require `read:org` to read checks
 
 ### Enabling PR Creation
 
@@ -212,13 +218,13 @@ PR_WHITELIST=mycompany/*,trusted-org/specific-repo
 - Set conservative rate limits
 - Review PRs before merging
 
-🔒 **What PR Creation CANNOT Do**:
-- Cannot create or modify commits
-- Cannot push code directly to branches
-- Cannot merge pull requests
-- Cannot delete branches or tags
-- Cannot modify existing PR content
-- Cannot access repositories not in whitelist
+🔒 **What PR Tools CANNOT Do**:
+- Cannot bypass branch protections or required reviews/checks
+- Cannot merge if required checks are failing or pending
+- Cannot access or modify repositories not in the whitelist
+- Cannot delete protected or default branches
+- No direct pushes; changes must be via PRs or the explicit `commit_files` tool
+- All actions are logged to `PR_AUDIT_LOG`
 
 ## Scripts
 
@@ -271,3 +277,99 @@ github-mcp-proxy/
 ## License
 
 MIT
+
+## PR Merge Setup and Testing
+
+Merging is optional and disabled by default. When enabled, merges are safe, respect branch protections and required checks, and are fully audited.
+
+### Enable PR Merge
+
+1) Update your .env:
+```bash
+PR_MERGE_ENABLED=true
+PR_MERGE_RATE_LIMIT_MAX=5
+PR_MERGE_RATE_LIMIT_WINDOW=3600000
+```
+
+2) Ensure your PAT scope:
+- Classic: repo
+- Fine-grained: Pull requests: Read and write (and repository contents if needed)
+- Some orgs may require read:org to read checks metadata
+
+3) Whitelist repositories:
+- Uses PR_WHITELIST (same as PR creation)
+- Format: owner/repo or owner/*
+
+4) Restart the server.
+
+### New Tools
+
+- merge_pull_request
+- update_pull_request
+- get_pr_mergeability
+- get_checks_for_sha
+
+### Example JSON-RPC tests (curl)
+
+List PRs:
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"1","method":"tools/call",
+  "params":{"name":"list_pull_requests","arguments":{"repo":"owner/repo","state":"open","limit":5}}
+}'
+```
+
+Check mergeability and required checks:
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"2","method":"tools/call",
+  "params":{"name":"get_pr_mergeability","arguments":{"repo":"owner/repo","prNumber":123}}
+}'
+```
+
+Get checks for a specific commit SHA:
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"2b","method":"tools/call",
+  "params":{"name":"get_checks_for_sha","arguments":{"repo":"owner/repo","sha":"abcdef123456"}}
+}'
+```
+
+Mark draft PR ready for review:
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"2c","method":"tools/call",
+  "params":{"name":"update_pull_request","arguments":{"repo":"owner/repo","prNumber":123,"draft":false}}
+}'
+```
+
+Happy-path merge (squash and delete branch):
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"3","method":"tools/call",
+  "params":{"name":"merge_pull_request","arguments":{
+    "repo":"owner/repo","prNumber":123,"merge_method":"squash","delete_branch":true
+  }}}
+}'
+```
+
+Safety merge with SHA guard:
+```bash
+curl -s http://localhost:8788/mcp -H 'Content-Type: application/json' -d '{
+  "jsonrpc":"2.0","id":"4","method":"tools/call",
+  "params":{"name":"merge_pull_request","arguments":{
+    "repo":"owner/repo","prNumber":123,"sha":"<HEAD_SHA_FROM_get_pr_mergeability>"
+  }}}
+}'
+```
+
+Blocked merge example:
+- Returns clean reason including mergeable_state and failing checks/status contexts.
+
+### Guardrails
+
+- Whitelist enforced via PR_WHITELIST
+- Separate rate limits for merges vs. PR creation
+- Optional SHA guard to avoid merging stale heads
+- Never bypasses branch protections or required checks
+- Attempts, blocks, failures, and successes audited to PR_AUDIT_LOG
