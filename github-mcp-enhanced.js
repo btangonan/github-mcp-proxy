@@ -112,7 +112,7 @@ app.use((req, res, next) => {
   res.header("Access-Control-Max-Age", "86400"); // 24 hours
 
   if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
+    return res.status(204).end();
   }
   next();
 });
@@ -1637,6 +1637,56 @@ toolRegistry.set("get_pull_request", handleGetPullRequest);
 toolRegistry.set("get_pr_mergeability", handleGetPRMergeability);
 toolRegistry.set("get_checks_for_sha", handleGetChecksForSha);
 
+// Helper: Create JSON-RPC error response with HTTP 200 to prevent transport errors
+function jsonRpcError(res, id, code, message, data = {}) {
+  return res.status(200).json({
+    jsonrpc: "2.0",
+    id,
+    error: {
+      code,
+      message,
+      data: {
+        ...data,
+        timestamp: new Date().toISOString()
+      }
+    }
+  });
+}
+
+// Helper: Map GitHub error to JSON-RPC error code
+function mapErrorCode(error) {
+  const errorMsg = String(error.message).toLowerCase();
+
+  if (errorMsg.includes('403') || errorMsg.includes('permission')) return -32001; // Permission denied
+  if (errorMsg.includes('404') || errorMsg.includes('not found')) return -32002; // Not found
+  if (errorMsg.includes('422') || errorMsg.includes('validation')) return -32003; // Validation error
+  if (errorMsg.includes('rate') && errorMsg.includes('limit')) return -32004; // Rate limit
+
+  return -32603; // Internal error (default)
+}
+
+// Helper: Explain GitHub errors in user-friendly terms
+function explainGitHubError(error, operation) {
+  const statusCode = error.response?.status || error.statusCode;
+  const message = error.message || 'Unknown error';
+
+  // Common GitHub error patterns
+  if (statusCode === 403) {
+    return `Permission denied. Ensure your GitHub token has the required scopes for ${operation}`;
+  }
+  if (statusCode === 404) {
+    return `Resource not found. ${message}`;
+  }
+  if (statusCode === 422) {
+    return `Validation failed: ${message}`;
+  }
+  if (message.includes('rate limit')) {
+    return `Rate limit exceeded. ${message}`;
+  }
+
+  return message;
+}
+
 // Enhanced GitHub API wrapper with caching
 async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET') {
   const cacheKey = getCacheKey(endpoint, { params, headers, method });
@@ -2235,14 +2285,8 @@ app.post("/mcp", async (req, res) => {
         const toolHandler = toolRegistry.get(name);
 
         if (!toolHandler) {
-          return res.status(404).json({
-            jsonrpc: "2.0",
-            id,
-            error: {
-              code: -32601,
-              message: `Unknown tool: ${name}`
-            }
-          });
+          // Return HTTP 200 with JSON-RPC error (not 404) to prevent transport failures
+          return jsonRpcError(res, id, -32601, `Unknown tool: ${name}`, { tool: name });
         }
 
         // Execute tool handler and return result
@@ -2256,37 +2300,22 @@ app.post("/mcp", async (req, res) => {
 
       } catch (error) {
         console.error("❌ Tool execution error:", error.message);
-        return res.status(400).json({
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32602,
-            message: `Invalid params: ${error.message}`
-          }
-        });
+
+        // Map to JSON-RPC error but keep HTTP 200 so clients don't treat it as transport failure
+        const code = mapErrorCode(error);
+        const message = explainGitHubError(error, params?.name || 'unknown operation');
+
+        return jsonRpcError(res, id, code, `Invalid params: ${message}`, { tool: params?.name });
       }
     }
 
-    // Unknown method
-    return res.status(501).json({
-      jsonrpc: "2.0",
-      id,
-      error: {
-        code: -32601,
-        message: `Method not found: ${method}`
-      }
-    });
+    // Unknown method - return HTTP 200 with JSON-RPC error
+    return jsonRpcError(res, id, -32601, `Method not found: ${method}`, { method });
 
   } catch (error) {
     console.error("❌ Error:", error.message);
-    return res.status(500).json({
-      jsonrpc: "2.0",
-      id: req.body?.id || null,
-      error: {
-        code: -32603,
-        message: `Internal error: ${error.message}`
-      }
-    });
+    // Return HTTP 200 with JSON-RPC error to prevent transport failures
+    return jsonRpcError(res, req.body?.id || null, -32603, `Internal error: ${error.message}`, {});
   }
 });
 
