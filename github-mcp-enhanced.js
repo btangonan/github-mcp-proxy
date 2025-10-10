@@ -122,14 +122,23 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: config.bodySizeLimit }));
 
 // Authentication middleware for /mcp endpoints
+// Optional auth: allows requests without token (for ChatGPT), validates if provided
 function authRequired(req, res, next) {
+  // If no token configured, allow all requests
   if (!config.mcpAuthToken) {
-    return res.status(500).json({ error: "MCP_AUTH_TOKEN not configured" });
+    return next();
   }
 
   const authHeader = req.headers.authorization || "";
+
+  // If no auth header provided, allow (for ChatGPT compatibility)
+  if (!authHeader) {
+    return next();
+  }
+
+  // If auth header IS provided, validate it (protects other clients)
   if (!authHeader.startsWith("Bearer ") || authHeader.slice(7).trim() !== config.mcpAuthToken) {
-    return res.status(401).json({ error: "Unauthorized - Invalid or missing Bearer token" });
+    return res.status(401).json({ error: "Unauthorized - Invalid Bearer token" });
   }
 
   next();
