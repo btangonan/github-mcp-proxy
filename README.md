@@ -121,6 +121,11 @@ The server includes **optional PR tools** (create, update, merge) that are **dis
 ### Security Design
 
 The PR feature implements multiple security layers:
+- **🔐 Path-Based Write Secret (NEW)** - Write operations require secret in URL path (`/mcp/<SECRET>`)
+  - Read operations: `/mcp` (public)
+  - Write operations: `/mcp/<SECRET>` (requires secret)
+  - Prevents casual drive-by writes while keeping reads accessible
+  - Secret can be rotated if exposed
 - **Disabled by default** - Requires explicit opt-in
 - **Repository whitelist** - Only specified repos can have PRs created/updated/merged
 - **Branch validation** - Actions occur on explicitly named branches
@@ -133,6 +138,9 @@ The PR feature implements multiple security layers:
 
 1. **Update your `.env` file**:
 ```bash
+# Enable write secret for path-based security (REQUIRED for write operations)
+MCP_WRITE_SECRET=63d8fd675336252cf31ef502684ce7a28bf2585f3f2f9e3a67027802d131d8fa
+
 # Enable PR creation
 PR_ENABLED=true
 
@@ -159,6 +167,10 @@ PR_TEMPLATE_REQUIRED=false
 3. **Restart the server** to apply changes
 
 ### Using PR Creation in ChatGPT
+
+**IMPORTANT**: For write operations, configure ChatGPT connector with the secret URL:
+- **Read-only URL**: `https://YOUR_NGROK_URL.ngrok-free.app/mcp`
+- **Write-enabled URL**: `https://YOUR_NGROK_URL.ngrok-free.app/mcp/<YOUR_SECRET>`
 
 Once enabled, you can ask ChatGPT to:
 - "Create a PR from my feature-branch to main in myrepo"
@@ -256,13 +268,16 @@ The server runs on port 8788 by default (configurable in `.env`).
 
 ## Security Notes
 
+- ✅ **Path-based write secret** protects write operations via URL path
 - ✅ Your PAT stays on your local machine
 - ✅ ngrok provides secure HTTPS tunneling
 - ✅ ChatGPT never sees your actual token
 - ✅ PR creation is disabled by default (opt-in feature)
 - ✅ Repository whitelist enforced for PR creation
+- ✅ Read operations accessible via `/mcp`, writes via `/mcp/<SECRET>`
 - ⚠️ Never commit `.env` to version control
 - ⚠️ Review PR feature risks before enabling
+- ⚠️ Rotate `MCP_WRITE_SECRET` if exposed or leaked
 
 ## Project Structure
 

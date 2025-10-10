@@ -30,6 +30,7 @@ const config = {
   bodySizeLimit: process.env.BODY_SIZE_LIMIT || '10mb',
   enableTrustProxy: process.env.TRUST_PROXY === 'true',
   mcpAuthToken: process.env.MCP_AUTH_TOKEN,
+  mcpWriteSecret: process.env.MCP_WRITE_SECRET,
 
   // Logging configuration
   logLevel: process.env.LOG_LEVEL || 'info',
@@ -121,6 +122,69 @@ app.use((req, res, next) => {
 // Parse JSON bodies with configurable size limit
 app.use(express.json({ limit: config.bodySizeLimit }));
 
+// Helper function to check if a tool is a write operation
+function isWriteTool(toolName) {
+  const writeTools = [
+    "create_branch",
+    "commit_files",
+    "create_pull_request",
+    "update_pull_request",
+    "merge_pull_request",
+    "create_issue",
+    "update_issue",
+    "add_issue_comment",
+    "add_pull_request_review_comment"
+  ];
+  return writeTools.includes(toolName);
+}
+
+// Path-based secret validation middleware for write operations
+function validateWriteSecret(req, res, next) {
+  // Only enforce for write operations
+  const isToolsCall = req.body?.method === "tools/call";
+  const toolName = req.body?.params?.name;
+  const isWrite = isToolsCall && isWriteTool(toolName);
+
+  // If not a write operation, allow through
+  if (!isWrite) {
+    return next();
+  }
+
+  // Write operation detected - require secret in path
+  const pathSecret = req.params.secret;
+
+  // If no write secret is configured, reject writes entirely
+  if (!config.mcpWriteSecret) {
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id: req.body?.id || null,
+      error: {
+        code: -32000,
+        message: "Write operations are disabled (MCP_WRITE_SECRET not configured)",
+        data: { tool: toolName, timestamp: new Date().toISOString() }
+      }
+    });
+  }
+
+  // Check if path secret matches configured secret
+  const secretMatches = pathSecret && pathSecret === config.mcpWriteSecret;
+
+  if (!secretMatches) {
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id: req.body?.id || null,
+      error: {
+        code: -32000,
+        message: `Write operation '${toolName}' requires secret path. Use /mcp/<SECRET> endpoint for write operations.`,
+        data: { tool: toolName, timestamp: new Date().toISOString() }
+      }
+    });
+  }
+
+  // Secret matches - allow write operation
+  next();
+}
+
 // Authentication middleware for /mcp endpoints
 // Optional auth: allows requests without token (for ChatGPT), validates if provided
 function authRequired(req, res, next) {
@@ -143,9 +207,6 @@ function authRequired(req, res, next) {
 
   next();
 }
-
-// Apply authentication to MCP endpoints
-app.use("/mcp", authRequired);
 
 // Simple in-memory cache with configurable TTL
 const cache = new Map();
@@ -1806,8 +1867,10 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
   }
 }
 
-// MCP endpoint
-app.post("/mcp", async (req, res) => {
+// MCP endpoint with optional secret for write operations
+// /mcp for read-only operations
+// /mcp/:secret for write operations (when MCP_WRITE_SECRET is configured)
+app.post(["/mcp", "/mcp/:secret"], authRequired, validateWriteSecret, async (req, res) => {
   const safeReq = JSON.parse(JSON.stringify(req.body || {}));
   if (safeReq?.params?.arguments?.body) {
     safeReq.params.arguments.body = `[${String(safeReq.params.arguments.body).length} chars]`;
