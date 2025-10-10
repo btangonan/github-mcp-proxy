@@ -256,16 +256,14 @@ function safeString(str, maxLength = 1000) {
 // Input validation caps
 function validateTitle(title) {
   assert(title && typeof title === 'string', 'Title must be a non-empty string');
-  const safe = safeString(title, 256);
-  assert(safe.length > 0 && safe.length <= 256, 'Title must be between 1 and 256 characters');
-  return safe;
+  assert(title.length >= 1 && title.length <= 256, 'Title must be between 1 and 256 characters');
+  return safeString(title, 256);
 }
 
 function validateBody(body) {
   if (!body) return '';
-  const safe = safeString(body, 10000);
-  assert(safe.length <= 10000, 'Body must not exceed 10,000 characters');
-  return safe;
+  assert(body.length <= 10000, 'Body must not exceed 10,000 characters');
+  return safeString(body, 10000);
 }
 
 function validateFiles(files) {
