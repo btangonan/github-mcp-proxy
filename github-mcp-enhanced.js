@@ -1211,13 +1211,15 @@ async function handleCreateBranch(args) {
     }
 
     // Create the new branch
-    const response = await githubRequest(`/repos/${owner}/${repo}/git/refs`, {
-      method: 'POST',
-      body: JSON.stringify({
+    const response = await githubRequest(
+      `/repos/${owner}/${repo}/git/refs`,
+      {
         ref: `refs/heads/${branchName}`,
         sha: baseSha
-      })
-    });
+      },
+      {},
+      'POST'
+    );
 
     // Log branch creation for audit
     await auditLog('BRANCH_CREATED', {
@@ -1280,13 +1282,15 @@ async function handleCommitFiles(args) {
     // Create blobs for each file
     const blobs = await Promise.all(args.files.map(async file => {
       const content = file.encoding === 'base64' ? file.content : Buffer.from(file.content).toString('base64');
-      const blob = await githubRequest(`/repos/${owner}/${repo}/git/blobs`, {
-        method: 'POST',
-        body: JSON.stringify({
+      const blob = await githubRequest(
+        `/repos/${owner}/${repo}/git/blobs`,
+        {
           content: content,
           encoding: 'base64'
-        })
-      });
+        },
+        {},
+        'POST'
+      );
       return {
         path: file.path,
         mode: '100644',
@@ -1296,31 +1300,37 @@ async function handleCommitFiles(args) {
     }));
 
     // Create a new tree with the files
-    const newTree = await githubRequest(`/repos/${owner}/${repo}/git/trees`, {
-      method: 'POST',
-      body: JSON.stringify({
+    const newTree = await githubRequest(
+      `/repos/${owner}/${repo}/git/trees`,
+      {
         base_tree: baseTreeSha,
         tree: blobs
-      })
-    });
+      },
+      {},
+      'POST'
+    );
 
     // Create the commit
-    const newCommit = await githubRequest(`/repos/${owner}/${repo}/git/commits`, {
-      method: 'POST',
-      body: JSON.stringify({
+    const newCommit = await githubRequest(
+      `/repos/${owner}/${repo}/git/commits`,
+      {
         message: args.message,
         tree: newTree.sha,
         parents: [currentSha]
-      })
-    });
+      },
+      {},
+      'POST'
+    );
 
     // Update the branch reference
-    await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${branchName}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
+    await githubRequest(
+      `/repos/${owner}/${repo}/git/refs/heads/${branchName}`,
+      {
         sha: newCommit.sha
-      })
-    });
+      },
+      {},
+      'PATCH'
+    );
 
     await auditLog('FILES_COMMITTED', {
       repo: `${owner}/${repo}`,
