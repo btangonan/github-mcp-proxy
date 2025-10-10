@@ -1706,7 +1706,9 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
 
     return response.data;
   } catch (error) {
-    console.error(`❌ GitHub API error for ${method} ${endpoint}:`, error.response?.status, error.message);
+    const status = error?.response?.status;
+    if (status && !error.statusCode) error.statusCode = status; // normalize for callers
+    console.error(`❌ GitHub API error for ${method} ${endpoint}:`, status, error.message);
     throw error;
   }
 }
