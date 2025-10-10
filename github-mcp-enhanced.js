@@ -1350,7 +1350,7 @@ async function handleCommitFiles(args) {
       branch: branchName,
       error: error.message
     });
-    throw new Error(explainGitHubError(error, 'commit_files'));
+    throw error;
   }
 }
 
@@ -1432,7 +1432,7 @@ async function handleMergePullRequest(args) {
     );
   } catch (e) {
     await auditLog('PR_MERGE_FAILED', { repo: `${owner}/${repo}`, prNumber, error: e.message });
-    throw new Error(explainGitHubError(e, 'merge_pull_request'));
+    throw e;
   }
 
   // Optional branch delete (non-fatal), avoid deleting base branch and default branch
@@ -1651,40 +1651,6 @@ function jsonRpcError(res, id, code, message, data = {}) {
       }
     }
   });
-}
-
-// Helper: Map GitHub error to JSON-RPC error code
-function mapErrorCode(error) {
-  const errorMsg = String(error.message).toLowerCase();
-
-  if (errorMsg.includes('403') || errorMsg.includes('permission')) return -32001; // Permission denied
-  if (errorMsg.includes('404') || errorMsg.includes('not found')) return -32002; // Not found
-  if (errorMsg.includes('422') || errorMsg.includes('validation')) return -32003; // Validation error
-  if (errorMsg.includes('rate') && errorMsg.includes('limit')) return -32004; // Rate limit
-
-  return -32603; // Internal error (default)
-}
-
-// Helper: Explain GitHub errors in user-friendly terms
-function explainGitHubError(error, operation) {
-  const statusCode = error.response?.status || error.statusCode;
-  const message = error.message || 'Unknown error';
-
-  // Common GitHub error patterns
-  if (statusCode === 403) {
-    return `Permission denied. Ensure your GitHub token has the required scopes for ${operation}`;
-  }
-  if (statusCode === 404) {
-    return `Resource not found. ${message}`;
-  }
-  if (statusCode === 422) {
-    return `Validation failed: ${message}`;
-  }
-  if (message.includes('rate limit')) {
-    return `Rate limit exceeded. ${message}`;
-  }
-
-  return message;
 }
 
 // Enhanced GitHub API wrapper with caching
@@ -2276,6 +2242,22 @@ app.post("/mcp", async (req, res) => {
       return res.json(result);
     }
 
+    // Helper to classify tool errors to JSON-RPC codes (HTTP 200 always)
+    function classifyToolError(name, errMsg) {
+      const msg = String(errMsg || "").toLowerCase();
+      // Specific merge semantics
+      if (name === "merge_pull_request") {
+        if (msg.includes("head sha mismatch")) return -32006; // stale SHA guard
+        if (msg.includes("pr not mergeable")) return -32005;   // dirty/protections
+      }
+      // Existing families
+      if (msg.includes("status code 403") || msg.includes("permission denied")) return -32001;
+      if (msg.includes("status code 404") || msg.includes("not found")) return -32002;
+      if (msg.includes("status code 422") || msg.includes("validation")) return -32003;
+      if (msg.includes("rate limit")) return -32004;
+      return -32603; // internal
+    }
+
     // Handle tool calls
     if (method === "tools/call") {
       try {
@@ -2300,12 +2282,16 @@ app.post("/mcp", async (req, res) => {
 
       } catch (error) {
         console.error("❌ Tool execution error:", error.message);
-
-        // Map to JSON-RPC error but keep HTTP 200 so clients don't treat it as transport failure
-        const code = mapErrorCode(error);
-        const message = explainGitHubError(error, params?.name || 'unknown operation');
-
-        return jsonRpcError(res, id, code, `Invalid params: ${message}`, { tool: params?.name });
+        const code = classifyToolError(params?.name, error.message);
+        return res.status(200).json({
+          jsonrpc: "2.0",
+          id,
+          error: {
+            code,
+            message: `Invalid params: ${error.message}`,
+            data: { tool: params?.name, timestamp: new Date().toISOString() }
+          }
+        });
       }
     }
 
@@ -2492,18 +2478,33 @@ app.post("/sse", async (req, res) => {
       });
     }
 
+    // Helper to classify tool errors to JSON-RPC codes (HTTP 200 always)
+    function classifyToolError(name, errMsg) {
+      const msg = String(errMsg || "").toLowerCase();
+      if (name === "merge_pull_request") {
+        if (msg.includes("head sha mismatch")) return -32006;
+        if (msg.includes("pr not mergeable")) return -32005;
+      }
+      if (msg.includes("status code 403") || msg.includes("permission denied")) return -32001;
+      if (msg.includes("status code 404") || msg.includes("not found")) return -32002;
+      if (msg.includes("status code 422") || msg.includes("validation")) return -32003;
+      if (msg.includes("rate limit")) return -32004;
+      return -32603;
+    }
+
     // Handle tool calls using registry
     if (method === "tools/call") {
       const { name, arguments: args } = params;
       const toolHandler = toolRegistry.get(name);
 
       if (!toolHandler) {
-        return res.status(404).json({
+        return res.status(200).json({
           jsonrpc: "2.0",
           id,
           error: {
             code: -32601,
-            message: `Unknown tool: ${name}`
+            message: `Unknown tool: ${name}`,
+            data: { tool: name, timestamp: new Date().toISOString() }
           }
         });
       }
@@ -2520,19 +2521,9 @@ app.post("/sse", async (req, res) => {
         // GitHub API errors should be returned as proper JSON-RPC errors, not 500s
         console.error(`❌ Tool '${name}' error:`, toolError.message);
 
-        // Determine appropriate error code based on the error
-        let errorCode = -32603; // Internal error (default)
-        let statusCode = 200; // JSON-RPC errors use 200 with error object
-
-        if (toolError.message.includes('Request failed with status code 403')) {
-          errorCode = -32001; // Custom: Permission denied
-        } else if (toolError.message.includes('Request failed with status code 404')) {
-          errorCode = -32002; // Custom: Not found
-        } else if (toolError.message.includes('Request failed with status code 422')) {
-          errorCode = -32003; // Custom: Validation error (PR already exists)
-        } else if (toolError.message.includes('rate limit exceeded')) {
-          errorCode = -32004; // Custom: Rate limit exceeded
-        }
+        // Classify to JSON-RPC error code (HTTP 200)
+        const errorCode = classifyToolError(name, toolError.message);
+        const statusCode = 200;
 
         return res.status(statusCode).json({
           jsonrpc: "2.0",
