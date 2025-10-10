@@ -1196,15 +1196,12 @@ async function handleCreateBranch(args) {
       baseSha = baseBranchData.object.sha;
     } catch (error) {
       if (error.statusCode === 404) {
-        // Try to get default branch from repo info
+        // Base branch not found - fallback to repository's default branch
         const repoInfo = await githubRequest(`/repos/${owner}/${repo}`);
-        const defaultBranch = repoInfo.default_branch;
-        if (baseBranch === 'main' || baseBranch === defaultBranch) {
-          const defaultBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${defaultBranch}`);
-          baseSha = defaultBranchData.object.sha;
-        } else {
-          throw new Error(`Base branch '${baseBranch}' not found`);
-        }
+        const defaultBranch = repoInfo.default_branch || 'main';
+        const defaultBranchData = await githubRequest(`/repos/${owner}/${repo}/git/refs/heads/${defaultBranch}`);
+        baseSha = defaultBranchData.object.sha;
+        console.log(`⚠️ Base branch '${baseBranch}' not found, using default branch '${defaultBranch}' instead`);
       } else {
         throw error;
       }
