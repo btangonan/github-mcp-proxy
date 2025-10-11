@@ -1867,10 +1867,8 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
   }
 }
 
-// MCP endpoint with optional secret for write operations
-// /mcp for read-only operations
-// /mcp/:secret for write operations (when MCP_WRITE_SECRET is configured)
-app.post(["/mcp", "/mcp/:secret"], authRequired, validateWriteSecret, async (req, res) => {
+// Shared MCP handler function
+const mcpHandler = async (req, res) => {
   const safeReq = JSON.parse(JSON.stringify(req.body || {}));
   if (safeReq?.params?.arguments?.body) {
     safeReq.params.arguments.body = `[${String(safeReq.params.arguments.body).length} chars]`;
@@ -2407,6 +2405,12 @@ app.post(["/mcp", "/mcp/:secret"], authRequired, validateWriteSecret, async (req
         }
       );
 
+      // Filter write tools if secret not provided in path
+      const hasWriteAccess = req.params.secret && req.params.secret === config.mcpWriteSecret;
+      if (!hasWriteAccess) {
+        result.result.tools = result.result.tools.filter(tool => !isWriteTool(tool.name));
+      }
+
       return res.json(result);
     }
 
@@ -2471,7 +2475,13 @@ app.post(["/mcp", "/mcp/:secret"], authRequired, validateWriteSecret, async (req
     // Return HTTP 200 with JSON-RPC error to prevent transport failures
     return jsonRpcError(res, req.body?.id || null, -32603, `Internal error: ${error.message}`, {});
   }
-});
+};
+
+// MCP endpoint routing
+// /mcp for read-only operations
+// /mcp/:secret for write operations (when MCP_WRITE_SECRET is configured)
+app.post("/mcp", authRequired, validateWriteSecret, mcpHandler);
+app.post("/mcp/:secret", authRequired, validateWriteSecret, mcpHandler);
 
 // Enhanced health check
 app.get("/health", (req, res) => {
