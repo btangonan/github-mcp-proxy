@@ -1,0 +1,63 @@
+{
+  "primary_framework": "Express.js",
+  "version": "5.1.0",
+  "http_client": "Axios 1.12.2",
+  "api_routes": [
+    {
+      "method": "POST",
+      "path": "/mcp",
+      "middleware": ["authRequired", "validateWriteSecret"],
+      "handler": "mcpHandler",
+      "purpose": "MCP read-only endpoint"
+    },
+    {
+      "method": "POST",
+      "path": "/mcp/:secret",
+      "middleware": ["authRequired", "validateWriteSecret"],
+      "handler": "mcpHandler",
+      "purpose": "MCP write-enabled endpoint with secret"
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "middleware": [],
+      "handler": "inline",
+      "purpose": "Health check endpoint"
+    },
+    {
+      "method": "GET",
+      "path": "/version",
+      "middleware": [],
+      "handler": "inline",
+      "purpose": "Version information"
+    },
+    {
+      "method": "GET",
+      "path": "/sse",
+      "middleware": [],
+      "handler": "inline",
+      "purpose": "Server-Sent Events endpoint"
+    },
+    {
+      "method": "POST",
+      "path": "/sse",
+      "middleware": [],
+      "handler": "inline",
+      "purpose": "SSE POST endpoint"
+    }
+  ],
+  "middleware": [
+    "helmet (security headers)",
+    "express-rate-limit (rate limiting)",
+    "express.json() (body parsing)",
+    "http-proxy-middleware (proxying)"
+  ],
+  "external_apis": [
+    {
+      "provider": "GitHub",
+      "base_url": "https://api.github.com",
+      "authentication": "Bearer token (GITHUB_PAT)",
+      "purpose": "GitHub API operations"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "validation_library": "express-validator (installed but NOT USED)",
+  "validation_coverage": {
+    "total_routes": 6,
+    "routes_with_validation": 0,
+    "percentage": 0
+  },
+  "routes_analysis": [
+    {
+      "route": "POST /mcp",
+      "has_schema": false,
+      "has_middleware_validation": true,
+      "validation_type": "custom middleware (authRequired, validateWriteSecret)",
+      "risk": "MEDIUM - Custom validation, no schema enforcement"
+    },
+    {
+      "route": "POST /mcp/:secret",
+      "has_schema": false,
+      "has_middleware_validation": true,
+      "validation_type": "custom middleware (authRequired, validateWriteSecret)",
+      "risk": "MEDIUM - Custom validation, no schema enforcement"
+    },
+    {
+      "route": "GET /health",
+      "has_schema": false,
+      "has_middleware_validation": false,
+      "validation_type": "none",
+      "risk": "LOW - Read-only health check"
+    },
+    {
+      "route": "GET /version",
+      "has_schema": false,
+      "has_middleware_validation": false,
+      "validation_type": "none",
+      "risk": "LOW - Read-only version endpoint"
+    },
+    {
+      "route": "GET /sse",
+      "has_schema": false,
+      "has_middleware_validation": false,
+      "validation_type": "none",
+      "risk": "MEDIUM - SSE endpoint, no validation"
+    },
+    {
+      "route": "POST /sse",
+      "has_schema": false,
+      "has_middleware_validation": false,
+      "validation_type": "none",
+      "risk": "HIGH - POST endpoint with no validation"
+    }
+  ],
+  "gaps": [
+    "No JSON Schema or Zod validation at API boundaries",
+    "express-validator dependency unused - wasted dependency",
+    "MCP JSON-RPC requests not validated against schemas",
+    "No type checking for incoming tool parameters",
+    "Manual validation in middleware is error-prone"
+  ],
+  "recommendations": [
+    "Implement JSON Schema validation for all MCP tool calls",
+    "Use express-validator or replace with Zod for type-safe validation",
+    "Add validation middleware to all POST endpoints",
+    "Define explicit input schemas for each MCP tool"
+  ]
+}

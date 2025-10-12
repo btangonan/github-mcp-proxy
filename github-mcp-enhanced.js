@@ -1,9 +1,13 @@
 require("dotenv").config();
 
 const express = require("express");
-const axios = require("axios");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
+const { validateToolParams, formatValidationErrors } = require("./mcp-tool-schemas");
+const github = require("./lib/github-client");
+const { setupMiddleware, isWriteTool, createWriteSecretValidator, createAuthMiddleware } = require("./lib/middleware");
+
+// Import tool handlers
+const readTools = require("./lib/tools/read-tools");
+const writeTools = require("./lib/tools/write-tools");
 
 const app = express();
 
@@ -12,11 +16,6 @@ const config = {
   // Server configuration
   port: parseInt(process.env.PORT) || 8788,
   host: process.env.HOST || 'localhost',
-
-  // GitHub API configuration
-  githubToken: process.env.GITHUB_PAT,
-  githubApiTimeout: parseInt(process.env.GITHUB_API_TIMEOUT) || 30000,
-  githubRetryAttempts: parseInt(process.env.GITHUB_RETRY_ATTEMPTS) || 3,
 
   // Rate limiting configuration
   rateLimitWindow: parseInt(process.env.RATE_LIMIT_WINDOW) || 15 * 60 * 1000, // 15 minutes
@@ -59,7 +58,8 @@ const config = {
 };
 
 // Validate required configuration
-if (!config.githubToken) {
+const githubToken = process.env.GITHUB_PAT || process.env.GITHUB_TOKEN;
+if (!githubToken) {
   console.error("❌ Please set GITHUB_PAT environment variable.");
   process.exit(1);
 }
@@ -68,7 +68,6 @@ console.log("📋 Server Configuration:");
 console.log(`   • Port: ${config.port}`);
 console.log(`   • Cache TTL: ${config.cacheTTL / 1000}s`);
 console.log(`   • Rate Limit: ${config.rateLimitMax} requests per ${config.rateLimitWindow / 60000} minutes`);
-console.log(`   • GitHub API Timeout: ${config.githubApiTimeout / 1000}s`);
 if (config.prEnabled) {
   console.log(`   • PR Creation: ENABLED`);
   console.log(`   • PR Whitelist: ${config.prWhitelist.length > 0 ? config.prWhitelist.join(', ') : 'None (disabled)'}`);
@@ -80,133 +79,12 @@ if (config.prMergeEnabled) {
 }
 console.log("");
 
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: false, // Allow ChatGPT to embed content
-  crossOriginEmbedderPolicy: false
-}));
+// Setup all middleware (security, rate limiting, CORS, JSON parsing)
+setupMiddleware(app, config);
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: config.rateLimitWindow,
-  max: config.rateLimitMax,
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true,
-  legacyHeaders: false,
-  skip: (req) => {
-    // Skip rate limiting for health checks
-    return req.path === '/health';
-  }
-});
-app.use(limiter);
-
-// Enhanced CORS for ChatGPT
-app.use((req, res, next) => {
-  const allowedOrigins = config.allowedOrigins;
-
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin) || !origin) {
-    res.header("Access-Control-Allow-Origin", origin || "*");
-  }
-
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  res.header("Access-Control-Max-Age", "86400"); // 24 hours
-
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-  next();
-});
-
-// Parse JSON bodies with configurable size limit
-app.use(express.json({ limit: config.bodySizeLimit }));
-
-// Helper function to check if a tool is a write operation
-function isWriteTool(toolName) {
-  const writeTools = [
-    "create_branch",
-    "commit_files",
-    "create_pull_request",
-    "update_pull_request",
-    "merge_pull_request",
-    "create_issue",
-    "update_issue",
-    "add_issue_comment",
-    "add_pull_request_review_comment"
-  ];
-  return writeTools.includes(toolName);
-}
-
-// Path-based secret validation middleware for write operations
-function validateWriteSecret(req, res, next) {
-  // Only enforce for write operations
-  const isToolsCall = req.body?.method === "tools/call";
-  const toolName = req.body?.params?.name;
-  const isWrite = isToolsCall && isWriteTool(toolName);
-
-  // If not a write operation, allow through
-  if (!isWrite) {
-    return next();
-  }
-
-  // Write operation detected - require secret in path
-  const pathSecret = req.params.secret;
-
-  // If no write secret is configured, reject writes entirely
-  if (!config.mcpWriteSecret) {
-    return res.status(200).json({
-      jsonrpc: "2.0",
-      id: req.body?.id || null,
-      error: {
-        code: -32000,
-        message: "Write operations are disabled (MCP_WRITE_SECRET not configured)",
-        data: { tool: toolName, timestamp: new Date().toISOString() }
-      }
-    });
-  }
-
-  // Check if path secret matches configured secret
-  const secretMatches = pathSecret && pathSecret === config.mcpWriteSecret;
-
-  if (!secretMatches) {
-    return res.status(200).json({
-      jsonrpc: "2.0",
-      id: req.body?.id || null,
-      error: {
-        code: -32000,
-        message: `Write operation '${toolName}' requires secret path. Use /mcp/<SECRET> endpoint for write operations.`,
-        data: { tool: toolName, timestamp: new Date().toISOString() }
-      }
-    });
-  }
-
-  // Secret matches - allow write operation
-  next();
-}
-
-// Authentication middleware for /mcp endpoints
-// Optional auth: allows requests without token (for ChatGPT), validates if provided
-function authRequired(req, res, next) {
-  // If no token configured, allow all requests
-  if (!config.mcpAuthToken) {
-    return next();
-  }
-
-  const authHeader = req.headers.authorization || "";
-
-  // If no auth header provided, allow (for ChatGPT compatibility)
-  if (!authHeader) {
-    return next();
-  }
-
-  // If auth header IS provided, validate it (protects other clients)
-  if (!authHeader.startsWith("Bearer ") || authHeader.slice(7).trim() !== config.mcpAuthToken) {
-    return res.status(401).json({ error: "Unauthorized - Invalid Bearer token" });
-  }
-
-  next();
-}
+// Create middleware instances with config
+const validateWriteSecret = createWriteSecretValidator(config);
+const authRequired = createAuthMiddleware(config);
 
 // Simple in-memory cache with configurable TTL
 const cache = new Map();
@@ -250,45 +128,7 @@ setInterval(() => {
   }
 }, 60000); // Check every minute
 
-// Enhanced GitHub API client with configurable timeouts and retries
-const github = axios.create({
-  baseURL: "https://api.github.com",
-  timeout: config.githubApiTimeout,
-  headers: {
-    Authorization: `Bearer ${config.githubToken}`,
-    Accept: "application/vnd.github.v3+json",
-    "User-Agent": "GitHub-MCP-Server/2.0"
-  }
-});
-
-// Retry interceptor
-github.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    const req = error.config;
-
-    // Don't retry if we've already retried the configured number of times
-    if (!req || req._retryCount >= config.githubRetryAttempts) {
-      return Promise.reject(error);
-    }
-
-    req._retryCount = req._retryCount || 0;
-    req._retryCount++;
-
-    // Retry on network errors or 5xx status codes
-    if (!error.response || (error.response.status >= 500 && error.response.status <= 599)) {
-      console.log(`🔄 Retrying GitHub API request (attempt ${req._retryCount})`);
-
-      // Exponential backoff: 1s, 2s, 4s
-      const delay = Math.pow(2, req._retryCount - 1) * 1000;
-      await new Promise(resolve => setTimeout(resolve, delay));
-
-      return github(req);
-    }
-
-    return Promise.reject(error);
-  }
-);
+// GitHub API client is now imported from lib/github-client.js
 
 // Cache helper functions
 function getCacheKey(url, params = {}) {
@@ -487,11 +327,9 @@ async function getChecksSummary(owner, repo, sha) {
   return { status, checks, message };
 }
 
-// Tool Registry Pattern
-const toolRegistry = new Map();
-
+// OLD TOOL HANDLERS BELOW - TO BE REMOVED AFTER EXTRACTION
 // Tool handler functions
-async function handleSearch(args) {
+async function handleSearch_OLD(args) {
   const query = safeString(args.query, 200);
   assert(query.length > 0, 'Search query cannot be empty');
 
@@ -1774,32 +1612,7 @@ async function handleGetChecksForSha(args) {
   };
 }
 
-// Register all tools
-toolRegistry.set("search", handleSearch);
-toolRegistry.set("fetch", handleFetch);
-toolRegistry.set("list_directory", handleListDirectory);
-toolRegistry.set("read_file", handleReadFile);
-toolRegistry.set("get_tree", handleGetTree);
-toolRegistry.set("get_commits", handleGetCommits);
-toolRegistry.set("get_branches", handleGetBranches);
-
-// Register PR/branch creation/commit tools only if enabled (guarded by flags/whitelist)
-if (config.prEnabled && config.prWhitelist.length > 0) {
-  toolRegistry.set("create_pull_request", handleCreatePullRequest);
-  toolRegistry.set("create_branch", handleCreateBranch);
-  toolRegistry.set("commit_files", handleCommitFiles);
-}
-
-// Always expose update/merge handlers; guardrails enforced inside handlers
-toolRegistry.set("update_pull_request", handleUpdatePullRequest);
-toolRegistry.set("merge_pull_request", handleMergePullRequest);
-
-// Register PR search/list tools (always available for reading)
-toolRegistry.set("list_pull_requests", handleListPullRequests);
-toolRegistry.set("search_pull_requests", handleSearchPullRequests);
-toolRegistry.set("get_pull_request", handleGetPullRequest);
-toolRegistry.set("get_pr_mergeability", handleGetPRMergeability);
-toolRegistry.set("get_checks_for_sha", handleGetChecksForSha);
+// Tool Registry is initialized and populated AFTER githubRequest is defined (see after line 1167)
 
 // Helper: Create JSON-RPC error response with HTTP 200 to prevent transport errors
 function jsonRpcError(res, id, code, message, data = {}) {
@@ -1866,6 +1679,77 @@ async function githubRequest(endpoint, params = {}, headers = {}, method = 'GET'
     throw error;
   }
 }
+
+// ============================================================================
+// Tool Registry Setup - Must come AFTER all helper functions are defined
+// ============================================================================
+
+// Tool Registry Pattern
+const toolRegistry = new Map();
+
+// Create dependency injection context for tools
+const toolContext = {
+  config,
+  github,
+  githubRequest,
+  // Validation functions
+  assert,
+  safeString,
+  validateTitle,
+  validateBody,
+  validateFiles,
+  validateRepoFormat,
+  validatePath,
+  validateBranch,
+  // Whitelist and rate limiting
+  isRepoWhitelisted,
+  checkPRRateLimit,
+  checkRateLimitCustom,
+  // Audit logging
+  auditLog,
+  // Helpers
+  getChecksSummary,
+  waitForMergeable,
+  // Maps for rate limiting
+  prRateLimiter,
+  prMergeRateLimiter
+};
+
+// Wrap tool handlers to inject dependencies
+function wrapToolHandler(handler) {
+  return async (args) => handler(args, toolContext);
+}
+
+// Register read tools from lib/tools/read-tools.js
+toolRegistry.set("search", wrapToolHandler(readTools.handleSearch));
+toolRegistry.set("fetch", wrapToolHandler(readTools.handleFetch));
+toolRegistry.set("list_directory", wrapToolHandler(readTools.handleListDirectory));
+toolRegistry.set("read_file", wrapToolHandler(readTools.handleReadFile));
+toolRegistry.set("get_tree", wrapToolHandler(readTools.handleGetTree));
+toolRegistry.set("get_commits", wrapToolHandler(readTools.handleGetCommits));
+toolRegistry.set("get_branches", wrapToolHandler(readTools.handleGetBranches));
+
+// Register write tools from lib/tools/write-tools.js (only if enabled)
+if (config.prEnabled && config.prWhitelist.length > 0) {
+  toolRegistry.set("create_pull_request", wrapToolHandler(writeTools.handleCreatePullRequest));
+  toolRegistry.set("create_branch", wrapToolHandler(writeTools.handleCreateBranch));
+  toolRegistry.set("commit_files", wrapToolHandler(writeTools.handleCommitFiles));
+}
+
+// Register inline PR tools (to be extracted later)
+toolRegistry.set("list_pull_requests", handleListPullRequests);
+toolRegistry.set("search_pull_requests", handleSearchPullRequests);
+toolRegistry.set("get_pull_request", handleGetPullRequest);
+toolRegistry.set("update_pull_request", handleUpdatePullRequest);
+toolRegistry.set("merge_pull_request", handleMergePullRequest);
+toolRegistry.set("get_pr_mergeability", handleGetPRMergeability);
+toolRegistry.set("get_checks_for_sha", handleGetChecksForSha);
+
+console.log(`✅ Tool registry initialized with ${toolRegistry.size} tools`);
+
+// ============================================================================
+// MCP Request Handlers
+// ============================================================================
 
 // Shared MCP handler function
 const mcpHandler = async (req, res) => {
@@ -2435,6 +2319,17 @@ const mcpHandler = async (req, res) => {
       try {
         const { name, arguments: args } = params;
 
+        // Validate tool parameters with JSON Schema
+        const validation = validateToolParams(name, args || {});
+        if (!validation.valid) {
+          const errorMessage = formatValidationErrors(validation.errors);
+          console.error(`❌ Schema validation failed for tool "${name}":`, errorMessage);
+          return jsonRpcError(res, id, -32602, errorMessage, {
+            tool: name,
+            validation_errors: validation.errors
+          });
+        }
+
         // Use tool registry for cleaner code organization
         const toolHandler = toolRegistry.get(name);
 
@@ -2741,31 +2636,34 @@ app.post("/sse", async (req, res) => {
   }
 });
 
-const port = process.env.PORT || 8788;
-app.listen(port, () => {
-  console.log("═══════════════════════════════════════════");
-  console.log("✅ GitHub MCP Enhanced v2.0 Running");
-  console.log(`📍 URL: http://localhost:${port}/mcp`);
-  console.log(`📍 SSE: http://localhost:${port}/sse`);
-  console.log("═══════════════════════════════════════════");
-  console.log("");
-  console.log("🚀 Enhanced Tools Available:");
-  console.log("  • search - Search repositories");
-  console.log("  • fetch - Get repo metadata");
-  console.log("  • list_directory - Browse folders");
-  console.log("  • read_file - Read file contents");
-  console.log("  • get_tree - Full repo structure");
-  console.log("  • get_commits - Commit history");
-  console.log("  • get_branches - List branches");
-  console.log("");
-}).on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`❌ Port ${port} is already in use. Please close the other process or use a different port.`);
-    process.exit(1);
-  } else {
-    console.error('❌ Server error:', err);
-  }
-});
+// Only start server if not being required as a module
+if (require.main === module) {
+  const port = process.env.PORT || 8788;
+  app.listen(port, () => {
+    console.log("═══════════════════════════════════════════");
+    console.log("✅ GitHub MCP Enhanced v2.0 Running");
+    console.log(`📍 URL: http://localhost:${port}/mcp`);
+    console.log(`📍 SSE: http://localhost:${port}/sse`);
+    console.log("═══════════════════════════════════════════");
+    console.log("");
+    console.log("🚀 Enhanced Tools Available:");
+    console.log("  • search - Search repositories");
+    console.log("  • fetch - Get repo metadata");
+    console.log("  • list_directory - Browse folders");
+    console.log("  • read_file - Read file contents");
+    console.log("  • get_tree - Full repo structure");
+    console.log("  • get_commits - Commit history");
+    console.log("  • get_branches - List branches");
+    console.log("");
+  }).on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`❌ Port ${port} is already in use. Please close the other process or use a different port.`);
+      process.exit(1);
+    } else {
+      console.error('❌ Server error:', err);
+    }
+  });
+}
 
 // Add global error handlers
 process.on('uncaughtException', (error) => {
@@ -2788,3 +2686,6 @@ process.on('SIGINT', () => {
   console.log('\n⚠️ SIGINT received, shutting down gracefully...');
   process.exit(0);
 });
+
+// Export app for testing
+module.exports = app;

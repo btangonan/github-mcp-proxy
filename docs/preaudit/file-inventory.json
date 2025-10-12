@@ -1,0 +1,49 @@
+{
+  "project": "github-mcp-proxy",
+  "scan_date": "2025-10-11",
+  "source_files": [
+    {
+      "path": "./github-mcp-enhanced.js",
+      "language": "javascript",
+      "loc": 2789,
+      "exceeds_limit": true,
+      "limit": 300,
+      "ratio": 9.3,
+      "risk": "HIGH - Monolithic file, difficult to maintain"
+    },
+    {
+      "path": "./github-mcp-v2.js",
+      "language": "javascript",
+      "loc": 1217,
+      "exceeds_limit": true,
+      "limit": 300,
+      "ratio": 4.1,
+      "risk": "HIGH - Large file, should be decomposed"
+    },
+    {
+      "path": "./create-branch-robust.js",
+      "language": "javascript",
+      "loc": 80,
+      "exceeds_limit": false
+    },
+    {
+      "path": "./test_tools.js",
+      "language": "javascript",
+      "loc": 85,
+      "exceeds_limit": false
+    },
+    {
+      "path": "./test-mcp.js",
+      "language": "javascript",
+      "loc": 64,
+      "exceeds_limit": false
+    }
+  ],
+  "summary": {
+    "total_source_files": 5,
+    "total_loc": 4235,
+    "files_exceeding_300_loc": 2,
+    "percentage_oversized": 40,
+    "largest_file": "github-mcp-enhanced.js (2789 LOC)"
+  }
+}
