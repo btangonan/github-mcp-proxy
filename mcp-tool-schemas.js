@@ -169,6 +169,23 @@ const getCommitsSchema = {
       maxLength: 100,
       description: 'Branch name'
     },
+    ref: {
+      type: 'string',
+      maxLength: 100,
+      description: 'Git ref (branch, tag, or commit SHA) - alias for branch'
+    },
+    path: {
+      type: 'string',
+      maxLength: 500,
+      description: 'Optional path to filter commits'
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 100,
+      default: 10,
+      description: 'Number of commits to return (alias for per_page)'
+    },
     sha: {
       type: 'string',
       pattern: shaPattern,
@@ -232,6 +249,34 @@ const listPullRequestsSchema = {
       default: 'open',
       description: 'PR state filter'
     },
+    base: {
+      type: 'string',
+      pattern: branchNamePattern,
+      maxLength: 100,
+      description: 'Filter by base branch'
+    },
+    head: {
+      type: 'string',
+      maxLength: 100,
+      description: 'Filter by head branch (format: user:branch or branch)'
+    },
+    sort: {
+      type: 'string',
+      enum: ['created', 'updated', 'popularity', 'long-running'],
+      description: 'Sort PRs by field'
+    },
+    direction: {
+      type: 'string',
+      enum: ['asc', 'desc'],
+      description: 'Sort direction'
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 100,
+      default: 30,
+      description: 'Max results (alias for per_page)'
+    },
     page: {
       type: 'integer',
       minimum: 1,
@@ -286,6 +331,124 @@ const getChecksForShaSchema = {
   additionalProperties: false
 };
 
+const getPullRequestSchema = {
+  $id: 'get_pull_request',
+  type: 'object',
+  required: ['repo', 'prNumber'],
+  properties: {
+    repo: {
+      type: 'string',
+      pattern: ownerRepoPattern,
+      description: 'Repository in format owner/repo'
+    },
+    prNumber: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Pull request number'
+    },
+    include_commits: {
+      type: 'boolean',
+      default: false,
+      description: 'Include commit list'
+    },
+    includeCommits: {
+      type: 'boolean',
+      default: false,
+      description: 'Include commit list (camelCase alias)'
+    },
+    include_files: {
+      type: 'boolean',
+      default: false,
+      description: 'Include changed files'
+    },
+    includeFiles: {
+      type: 'boolean',
+      default: false,
+      description: 'Include changed files (camelCase alias)'
+    },
+    include_reviews: {
+      type: 'boolean',
+      default: false,
+      description: 'Include reviews'
+    },
+    includeReviews: {
+      type: 'boolean',
+      default: false,
+      description: 'Include reviews (camelCase alias)'
+    }
+  },
+  additionalProperties: false
+};
+
+const searchPullRequestsSchema = {
+  $id: 'search_pull_requests',
+  type: 'object',
+  required: ['query'],
+  properties: {
+    query: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 500,
+      description: 'Search query (automatically prepends is:pr)'
+    },
+    repo: {
+      type: 'string',
+      pattern: ownerRepoPattern,
+      description: 'Optional: limit to specific repo'
+    },
+    sort: {
+      type: 'string',
+      enum: ['comments', 'reactions', 'created', 'updated'],
+      description: 'Sort field'
+    },
+    order: {
+      type: 'string',
+      enum: ['asc', 'desc'],
+      description: 'Sort order'
+    },
+    limit: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 100,
+      default: 30,
+      description: 'Max results'
+    },
+    page: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 100,
+      default: 1,
+      description: 'Page number'
+    }
+  },
+  additionalProperties: false
+};
+
+const createBranchSchema = {
+  $id: 'create_branch',
+  type: 'object',
+  required: ['repo', 'branch'],
+  properties: {
+    repo: {
+      type: 'string',
+      pattern: ownerRepoPattern,
+      description: 'Repository in format owner/repo'
+    },
+    branch: {
+      type: 'string',
+      pattern: branchNamePattern,
+      maxLength: 100,
+      description: 'Name for the new branch'
+    },
+    from: {
+      type: 'string',
+      maxLength: 100,
+      description: 'Source branch or commit SHA (defaults to default branch)'
+    }
+  },
+  additionalProperties: false
+};
+
 // ============================================================================
 // WRITE TOOLS SCHEMAS
 // ============================================================================
@@ -293,7 +456,7 @@ const getChecksForShaSchema = {
 const createPullRequestSchema = {
   $id: 'create_pull_request',
   type: 'object',
-  required: ['repo', 'title', 'head', 'base'],
+  required: ['repo', 'title', 'head'],
   properties: {
     repo: {
       type: 'string',
@@ -321,12 +484,52 @@ const createPullRequestSchema = {
       type: 'string',
       pattern: branchNamePattern,
       maxLength: 100,
-      description: 'Target branch name'
+      description: 'Target branch name (defaults to default branch)'
     },
     draft: {
       type: 'boolean',
       default: false,
       description: 'Create as draft PR'
+    },
+    create_branch_if_missing: {
+      type: 'boolean',
+      default: false,
+      description: 'Create the head branch if it doesn\'t exist'
+    },
+    files: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 20,
+      items: {
+        type: 'object',
+        required: ['path', 'content'],
+        properties: {
+          path: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 500,
+            description: 'File path'
+          },
+          content: {
+            type: 'string',
+            description: 'File content'
+          },
+          encoding: {
+            type: 'string',
+            enum: ['utf8', 'base64'],
+            default: 'utf8',
+            description: 'Content encoding'
+          }
+        },
+        additionalProperties: false
+      },
+      description: 'Optional files to commit to the branch before creating PR'
+    },
+    commit_message: {
+      type: 'string',
+      minLength: 1,
+      maxLength: 256,
+      description: 'Commit message if files are provided'
     }
   },
   additionalProperties: false
@@ -488,8 +691,11 @@ const validators = {
   list_pull_requests: ajv.compile(listPullRequestsSchema),
   get_pr_mergeability: ajv.compile(getPrMergeabilitySchema),
   get_checks_for_sha: ajv.compile(getChecksForShaSchema),
+  get_pull_request: ajv.compile(getPullRequestSchema),
+  search_pull_requests: ajv.compile(searchPullRequestsSchema),
 
   // Write tools
+  create_branch: ajv.compile(createBranchSchema),
   create_pull_request: ajv.compile(createPullRequestSchema),
   update_pull_request: ajv.compile(updatePullRequestSchema),
   merge_pull_request: ajv.compile(mergePullRequestSchema),
@@ -568,6 +774,9 @@ module.exports = {
     list_pull_requests: listPullRequestsSchema,
     get_pr_mergeability: getPrMergeabilitySchema,
     get_checks_for_sha: getChecksForShaSchema,
+    get_pull_request: getPullRequestSchema,
+    search_pull_requests: searchPullRequestsSchema,
+    create_branch: createBranchSchema,
     create_pull_request: createPullRequestSchema,
     update_pull_request: updatePullRequestSchema,
     merge_pull_request: mergePullRequestSchema,
