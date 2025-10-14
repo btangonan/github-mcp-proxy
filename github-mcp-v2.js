@@ -666,9 +666,10 @@ app.use(express.json({ limit: config.bodySizeLimit }));
 // Main MCP endpoint
 app.post("/mcp", async (req, res) => {
   // Set keep-alive headers to prevent disconnections
+  // Reduced timeout to 30s to match common infrastructure timeouts (Render, proxies)
   res.set({
     'Connection': 'keep-alive',
-    'Keep-Alive': 'timeout=60, max=1000',
+    'Keep-Alive': 'timeout=30, max=1000',
     'X-Content-Type-Options': 'nosniff'
   });
 
@@ -909,10 +910,11 @@ const sseHandler = async (req, res) => {
   console.log("Method:", req.method);
   console.log("Body:", req.body);
 
-  // Keep connection alive
+  // Keep connection alive with more frequent heartbeats
+  // Reduced from 30s to 15s to prevent Render/proxy timeouts
   const keepAlive = setInterval(() => {
     res.write(":keepalive\n\n");
-  }, 30000);
+  }, 15000);
 
   // Handle SSE messages
   req.on("close", () => {
@@ -1186,6 +1188,12 @@ async function startServer() {
     console.log(`   • Available at: http://localhost:${config.port}`);
     console.log("");
   });
+
+  // Configure TCP keepalive to prevent connection drops at infrastructure level
+  server.keepAliveTimeout = 65000; // 65s (longer than Keep-Alive header timeout)
+  server.headersTimeout = 66000; // 66s (slightly longer than keepAliveTimeout)
+
+  console.log(`🔧 TCP keepalive configured: ${server.keepAliveTimeout}ms`);
 
   // Warm up GitHub client after server starts
   await warmupGitHubClient();
